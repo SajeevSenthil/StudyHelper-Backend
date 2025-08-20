@@ -14,7 +14,8 @@ from summarizer import summarize_text, extract_keywords, summarize_and_save
 from resources import get_study_resources
 from supabase_client import (save_document_session, get_document, get_user_documents, 
                            get_document_with_download_tracking, increment_download_count,
-                           get_saved_summaries, supabase)
+                           get_saved_summaries, get_user_summaries_with_files, 
+                           get_summary_file_content, supabase)
 from quiz_generator import generate_quiz_questions, generate_performance_feedback
 from quiz_database import (save_quiz_to_database, get_quiz_by_id, save_user_quiz_attempt,
                           get_user_quiz_attempts, get_quiz_attempt_details, create_dummy_document)
@@ -348,6 +349,44 @@ async def save_session(request: SaveSessionRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Save session failed: {str(e)}")
+
+@app.get("/summaries/{user_id}")
+async def get_user_summaries_endpoint(user_id: int, limit: Optional[int] = 50):
+    """Get user's saved summaries with file URLs"""
+    try:
+        print(f"[DEBUG] Getting summaries for user_id: {user_id}, limit: {limit}")
+        result = get_user_summaries_with_files(user_id, limit)
+        print(f"[DEBUG] Result: {result}")
+        
+        if result["success"]:
+            return result
+        else:
+            raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[DEBUG] Exception in summaries endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve summaries: {str(e)}")
+
+@app.get("/summary-file/{filename}")
+async def download_summary_file(filename: str):
+    """Download a summary .txt file from storage"""
+    try:
+        content = get_summary_file_content(filename)
+        if content:
+            return {
+                "success": True,
+                "content": content,
+                "filename": filename
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Summary file not found")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to download summary file: {str(e)}")
 
 @app.get("/documents/{doc_id}")
 async def get_document_by_id(doc_id: int):
