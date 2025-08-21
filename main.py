@@ -14,8 +14,8 @@ from summarizer import summarize_text, extract_keywords, summarize_and_save
 from resources import get_study_resources
 from supabase_client import (save_document_session, get_document, get_user_documents, 
                            get_document_with_download_tracking, increment_download_count,
-                           get_saved_summaries, get_user_summaries_with_files, 
-                           get_summary_file_content, supabase)
+                           get_saved_summaries, supabase, get_summary_file_content, 
+                           save_uploaded_file_to_storage, get_user_summaries_with_files)
 from quiz_generator import generate_quiz_questions, generate_performance_feedback
 from quiz_database import (save_quiz_to_database, get_quiz_by_id, save_user_quiz_attempt,
                           get_user_quiz_attempts, get_quiz_attempt_details, create_dummy_document)

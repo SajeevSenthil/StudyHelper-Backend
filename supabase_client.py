@@ -3,6 +3,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from typing import Dict, Any, Optional
 from datetime import datetime
+import io
 
 # Load environment variables
 load_dotenv()
@@ -15,12 +16,39 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def save_document_session(user_id: int, topic: str, original_content: str, 
                          summary: str, resources: list, keywords: str = None) -> Dict[str, Any]:
-    """Save a complete document session to Supabase documents table"""
+    """Save a complete document session to Supabase documents table and storage"""
     try:
+        # Generate unique filename for the summary
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        summary_filename = f"summary_{user_id}_{timestamp}.txt"
+        
+        # Save summary as .txt file to Supabase storage bucket
+        summary_file_url = None
+        if summary:
+            try:
+                summary_bytes = summary.encode('utf-8')
+                storage_response = supabase.storage.from_("summaries").upload(
+                    path=summary_filename,
+                    file=summary_bytes,
+                    file_options={"content-type": "text/plain"}
+                )
+                
+                if storage_response:
+                    # Get public URL for the uploaded file
+                    summary_file_url = supabase.storage.from_("summaries").get_public_url(summary_filename)
+                    print(f"[DEBUG] Summary saved to storage: {summary_filename}")
+                else:
+                    print(f"[DEBUG] Failed to save summary to storage")
+            except Exception as storage_error:
+                print(f"[DEBUG] Storage error: {str(storage_error)}")
+                # Continue without storage if it fails
+        
         # Prepare media JSONB data
         media_data = {
             "original_content": original_content,
             "summary": summary,
+            "summary_file_url": summary_file_url,
+            "summary_filename": summary_filename,
             "keywords": keywords,
             "user_id": user_id,
             "created_at": datetime.now().isoformat(),
@@ -43,6 +71,7 @@ def save_document_session(user_id: int, topic: str, original_content: str,
                 "success": True, 
                 "doc_id": doc_id, 
                 "message": "Document saved successfully",
+                "summary_file_url": summary_file_url,
                 "timestamp": media_data["created_at"]
             }
         else:
@@ -50,6 +79,98 @@ def save_document_session(user_id: int, topic: str, original_content: str,
             
     except Exception as e:
         return {"success": False, "message": f"Database error: {str(e)}", "error": str(e)}
+
+def get_summary_file_content(filename: str) -> Optional[str]:
+    """Download and return the content of a summary .txt file from storage"""
+    try:
+        # Download file from storage
+        storage_response = supabase.storage.from_("summaries").download(filename)
+        
+        if storage_response:
+            # Convert bytes to string
+            content = storage_response.decode('utf-8')
+            return content
+        return None
+        
+    except Exception as e:
+        print(f"Error downloading summary file {filename}: {str(e)}")
+        return None
+
+def save_uploaded_file_to_storage(file_content: bytes, filename: str, user_id: int) -> Dict[str, Any]:
+    """Save uploaded file to Supabase storage bucket"""
+    try:
+        # Generate unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_extension = filename.split('.')[-1] if '.' in filename else 'txt'
+        unique_filename = f"upload_{user_id}_{timestamp}.{file_extension}"
+        
+        # Determine content type based on file extension
+        content_type_map = {
+            'pdf': 'application/pdf',
+            'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'txt': 'text/plain'
+        }
+        content_type = content_type_map.get(file_extension.lower(), 'application/octet-stream')
+        
+        # Upload to storage
+        storage_response = supabase.storage.from_("summaries").upload(
+            path=unique_filename,
+            file=file_content,
+            file_options={"content-type": content_type}
+        )
+        
+        if storage_response:
+            file_url = supabase.storage.from_("summaries").get_public_url(unique_filename)
+            return {
+                "success": True,
+                "filename": unique_filename,
+                "file_url": file_url,
+                "original_filename": filename
+            }
+        else:
+            return {"success": False, "error": "Failed to upload file to storage"}
+            
+    except Exception as e:
+        return {"success": False, "error": f"Storage upload error: {str(e)}"}
+
+def get_user_summaries_with_files(user_id: int, limit: int = 50) -> Dict[str, Any]:
+    """Get user's saved summaries with file URLs"""
+    try:
+        # Use filter for JSONB field
+        response = supabase.table("documents").select("*").filter("media->>user_id", "eq", str(user_id)).order("doc_id", desc=True).limit(limit).execute()
+        
+        summaries = []
+        if response.data:
+            for doc in response.data:
+                media = doc.get("media", {})
+                summary_data = {
+                    "doc_id": doc["doc_id"],
+                    "topic": doc["topic"],
+                    "created_at": media.get("created_at"),
+                    "summary": media.get("summary", ""),
+                    "summary_filename": media.get("summary_filename"),
+                    "summary_file_url": media.get("summary_file_url"),
+                    "download_count": media.get("download_count", 0),
+                    "original_length": media.get("original_length", 0),
+                    "summary_length": media.get("summary_length", 0),
+                    "resources": doc.get("resources", [])
+                }
+                summaries.append(summary_data)
+        
+        return {
+            "success": True,
+            "summaries": summaries,
+            "count": len(summaries)
+        }
+        
+    except Exception as e:
+        print(f"[DEBUG] Error in get_user_summaries_with_files: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Database error: {str(e)}",
+            "summaries": [],
+            "count": 0
+        }
 
 def increment_download_count(doc_id: int) -> Dict[str, Any]:
     """Increment download count for a document"""
@@ -137,53 +258,6 @@ def get_user_documents(user_id: int = None) -> list:
         print(f"Error fetching user documents: {str(e)}")
         return []
 
-def get_user_summaries_with_files(user_id: int, limit: int = 50) -> Dict[str, Any]:
-    """Get user's saved summaries with file URLs for download"""
-    try:
-        # Use .filter() instead of .eq() for JSONB queries
-        response = supabase.table("documents").select("*").filter("media->>user_id", "eq", str(user_id)).order("doc_id", desc=True).limit(limit).execute()
-        
-        summaries = []
-        if response.data:
-            for doc in response.data:
-                media = doc.get("media", {})
-                
-                # Generate filename for storage
-                topic_safe = "".join(c for c in doc["topic"] if c.isalnum() or c in (' ', '-', '_')).rstrip()
-                summary_filename = f"{topic_safe}_{doc['doc_id']}.txt"
-                
-                # Generate file URL (you might want to check if file actually exists)
-                summary_file_url = f"summaries/{summary_filename}"
-                
-                summary_item = {
-                    "doc_id": doc["doc_id"],
-                    "topic": doc["topic"],
-                    "created_at": media.get("created_at", ""),
-                    "summary": media.get("summary", ""),
-                    "summary_filename": summary_filename,
-                    "summary_file_url": summary_file_url,
-                    "download_count": media.get("download_count", 0),
-                    "original_length": media.get("original_length", 0),
-                    "summary_length": media.get("summary_length", 0),
-                    "resources": doc.get("resources", [])
-                }
-                summaries.append(summary_item)
-        
-        return {
-            "success": True,
-            "summaries": summaries,
-            "count": len(summaries)
-        }
-        
-    except Exception as e:
-        print(f"Error in get_user_summaries_with_files: {str(e)}")
-        return {
-            "success": False,
-            "error": str(e),
-            "summaries": [],
-            "count": 0
-        }
-
 def get_saved_summaries(user_id: int = None, limit: int = 50) -> Dict[str, Any]:
     """Get saved summaries with pagination support"""
     try:
@@ -253,68 +327,3 @@ def delete_document(doc_id: int, user_id: int = None) -> Dict[str, Any]:
             
     except Exception as e:
         return {"success": False, "message": f"Database error: {str(e)}", "error": str(e)}
-
-# File storage functions
-def save_uploaded_file_to_storage(file_content: bytes, filename: str) -> Dict[str, Any]:
-    """Save uploaded file content to Supabase storage"""
-    try:
-        # Upload to the summaries bucket
-        response = supabase.storage.from_("summaries").upload(filename, file_content)
-        
-        if response:
-            return {
-                "success": True,
-                "filename": filename,
-                "message": "File uploaded successfully"
-            }
-        else:
-            return {
-                "success": False,
-                "error": "Failed to upload file to storage"
-            }
-            
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Storage upload error: {str(e)}"
-        }
-
-def get_summary_file_content(filename: str) -> str:
-    """Get summary file content from Supabase storage"""
-    try:
-        response = supabase.storage.from_("summaries").download(filename)
-        if response:
-            return response.decode('utf-8')
-        return None
-        
-    except Exception as e:
-        print(f"Error downloading file {filename}: {str(e)}")
-        return None
-
-def create_txt_file_content(summary: str, topic: str, keywords: str = "", resources: list = None) -> str:
-    """Create formatted .txt file content"""
-    if resources is None:
-        resources = []
-    
-    content = f"STUDY SUMMARY\n"
-    content += f"=" * 50 + "\n\n"
-    content += f"Topic: {topic}\n\n"
-    
-    if keywords:
-        content += f"Keywords: {keywords}\n\n"
-    
-    content += f"Summary:\n"
-    content += f"-" * 20 + "\n"
-    content += f"{summary}\n\n"
-    
-    if resources:
-        content += f"Additional Resources:\n"
-        content += f"-" * 30 + "\n"
-        for i, resource in enumerate(resources, 1):
-            content += f"{i}. {resource}\n"
-        content += "\n"
-    
-    content += f"Generated by StudyHelper\n"
-    content += f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    
-    return content
