@@ -1180,11 +1180,14 @@ async def submit_quiz(request: QuizSubmissionRequest, current_user: str = Depend
         raise HTTPException(status_code=500, detail=f"Quiz submission failed: {str(e)}")
 
 @app.post("/quiz/save")
-async def save_quiz_with_title(request: dict):
+@app.post("/api/save-quiz-performance")  # Alternative route for frontend compatibility
+async def save_quiz_with_title(request: dict, current_user: str = Depends(get_current_user_dev)):
     """Save quiz with custom title by creating a new quiz entry with all questions"""
     try:
         user_quiz_id = request.get("user_quiz_id")
         custom_title = request.get("custom_title", "").strip()
+        
+        print(f"[DEBUG] Save quiz request: user_quiz_id={user_quiz_id}, custom_title={custom_title}, current_user={current_user}")
         
         if not user_quiz_id or not custom_title:
             raise HTTPException(status_code=400, detail="user_quiz_id and custom_title are required")
@@ -1196,6 +1199,15 @@ async def save_quiz_with_title(request: dict):
             raise HTTPException(status_code=404, detail="Quiz attempt not found")
         
         attempt_data = quiz_attempt_response.data[0]
+        print(f"[DEBUG] Quiz attempt data: {attempt_data}")
+        
+        # Verify the quiz attempt belongs to the current user (or use current_user if attempt user_id is null)
+        attempt_user_id = attempt_data.get("user_id") or current_user
+        print(f"[DEBUG] attempt_user_id={attempt_user_id}, current_user={current_user}")
+        
+        if attempt_user_id != current_user:
+            raise HTTPException(status_code=403, detail="You can only save your own quiz attempts")
+        
         original_quiz_id = attempt_data["quiz_id"]
         
         # Get original quiz info
@@ -1206,10 +1218,15 @@ async def save_quiz_with_title(request: dict):
         original_quiz = original_quiz_response.data[0]
         
         # Create new quiz entry with custom title
+        print(f"[DEBUG] Creating new quiz with user_id={current_user}, title={custom_title}")
         new_quiz_response = supabase.table("quizzes").insert({
+            "user_id": current_user,  # Use current_user instead of attempt_data user_id
             "topic": custom_title,
-            "performance_report": original_quiz.get("performance_report")
+            "performance_report": original_quiz.get("performance_report"),
+            "total_questions": original_quiz.get("total_questions", 0)
         }).execute()
+        
+        print(f"[DEBUG] New quiz response: {new_quiz_response}")
         
         if not new_quiz_response.data:
             raise HTTPException(status_code=500, detail="Failed to create new quiz entry")
