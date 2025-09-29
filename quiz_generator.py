@@ -8,7 +8,7 @@ import os
 # Load environment variables
 load_dotenv()
 
-# Initialize OpenAI client
+# Configure APIs - Use OpenAI for quiz generation
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def clean_quiz_response(text: str) -> str:

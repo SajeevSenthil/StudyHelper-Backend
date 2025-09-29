@@ -14,7 +14,17 @@ try:
     from supabase import create_client, Client
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+    SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+    
+    # Use service key if available to bypass RLS, otherwise use anon key
+    if SUPABASE_SERVICE_KEY and SUPABASE_URL:
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        print("[DEBUG] Quiz database using Supabase service key (bypasses RLS)")
+    elif SUPABASE_URL and SUPABASE_KEY:
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("[DEBUG] Quiz database using Supabase anon key")
+    else:
+        supabase = None
 except ImportError:
     supabase = None
 
@@ -46,7 +56,7 @@ def get_db_connection():
         print("Falling back to Supabase client for database operations...")
         return None
 
-def save_quiz_to_database(topic: str, questions_data: List[Dict], performance_report: str = None) -> Dict[str, Any]:
+def save_quiz_to_database(topic: str, questions_data: List[Dict], performance_report: str = None, user_id: str = None) -> Dict[str, Any]:
     """
     Save a complete quiz to the database with all questions and options using raw SQL
     """
@@ -55,7 +65,7 @@ def save_quiz_to_database(topic: str, questions_data: List[Dict], performance_re
         # Fallback to Supabase client
         if supabase:
             print("Using Supabase client fallback for save_quiz_to_database")
-            return save_quiz_to_database_supabase(topic, questions_data, performance_report)
+            return save_quiz_to_database_supabase(topic, questions_data, performance_report, user_id)
         else:
             return {"success": False, "error": "Database connection failed and no Supabase fallback available"}
     
@@ -65,13 +75,17 @@ def save_quiz_to_database(topic: str, questions_data: List[Dict], performance_re
         # Begin transaction
         cursor.execute("BEGIN;")
         
+        # Use demo user if no user_id provided
+        if not user_id:
+            user_id = "550e8400-e29b-41d4-a716-446655440000"
+        
         # 1. Create quiz record
         quiz_insert_sql = """
-            INSERT INTO quizzes (topic, performance_report) 
-            VALUES (%s, %s) 
+            INSERT INTO quizzes (user_id, topic, performance_report, total_questions) 
+            VALUES (%s, %s, %s, %s) 
             RETURNING quiz_id;
         """
-        cursor.execute(quiz_insert_sql, (topic[:255], performance_report))
+        cursor.execute(quiz_insert_sql, (user_id, topic[:255], performance_report, len(questions_data)))
         quiz_result = cursor.fetchone()
         quiz_id = quiz_result['quiz_id']
         
@@ -125,21 +139,31 @@ def save_quiz_to_database(topic: str, questions_data: List[Dict], performance_re
         cursor.close()
         conn.close()
 
-def save_quiz_to_database_supabase(topic: str, questions_data: List[Dict], performance_report: str = None) -> Dict[str, Any]:
+def save_quiz_to_database_supabase(topic: str, questions_data: List[Dict], performance_report: str = None, user_id: str = None) -> Dict[str, Any]:
     """
     Fallback function to save quiz using Supabase client
     """
     try:
-        # Create quiz record
+        # Use demo user if no user_id provided
+        if not user_id:
+            user_id = "550e8400-e29b-41d4-a716-446655440000"
+        
+        print(f"[DEBUG] Attempting to save quiz for user_id: {user_id}")
+        
+        # Create quiz record directly (service key should bypass RLS)
+        print(f"[DEBUG] Creating quiz with topic: {topic[:50]}...")
         quiz_result = supabase.table("quizzes").insert({
+            "user_id": user_id,
             "topic": topic[:255],
-            "performance_report": performance_report
+            "performance_report": performance_report,
+            "total_questions": len(questions_data)
         }).execute()
         
         if not quiz_result.data:
-            return {"success": False, "error": "Failed to create quiz record"}
+            return {"success": False, "error": "Failed to create quiz record - no data returned"}
         
         quiz_id = quiz_result.data[0]["quiz_id"]
+        print(f"[DEBUG] Quiz created with ID: {quiz_id}")
         
         # Save each question and its options
         for order, question_data in enumerate(questions_data, 1):
@@ -185,7 +209,16 @@ def save_quiz_to_database_supabase(topic: str, questions_data: List[Dict], perfo
         }
         
     except Exception as e:
-        return {"success": False, "error": f"Supabase error: {str(e)}"}
+        error_details = str(e)
+        print(f"[ERROR] Supabase quiz save error: {error_details}")
+        
+        # Provide more specific error messages
+        if "violates foreign key constraint" in error_details and "user_id" in error_details:
+            return {"success": False, "error": f"Demo user does not exist in auth.users table. Please run fix_demo_user.sql script. Details: {error_details}"}
+        elif "violates row-level security policy" in error_details:
+            return {"success": False, "error": f"Row-level security policy violation. Please check RLS policies. Details: {error_details}"}
+        else:
+            return {"success": False, "error": f"Supabase error: {error_details}"}
 
 def get_quiz_by_id(quiz_id: int) -> Optional[Dict[str, Any]]:
     """
@@ -207,7 +240,7 @@ def get_quiz_by_id(quiz_id: int) -> Optional[Dict[str, Any]]:
         
         # Get quiz basic info
         quiz_select_sql = """
-            SELECT quiz_id, topic, performance_report 
+            SELECT quiz_id, user_id, topic, performance_report, total_questions, created_at 
             FROM quizzes 
             WHERE quiz_id = %s;
         """
@@ -348,7 +381,7 @@ def get_quiz_by_id_supabase(quiz_id: int) -> Optional[Dict[str, Any]]:
         print(f"Error fetching quiz with Supabase: {str(e)}")
         return None
 
-def save_user_quiz_attempt(user_id: int, quiz_id: int, doc_id: int, user_answers: List[Dict], 
+def save_user_quiz_attempt(user_id: str, quiz_id: int, user_answers: List[Dict], 
                           total_marks: int, score: int) -> Dict[str, Any]:
     """
     Save user's quiz attempt and answers using raw SQL
@@ -358,7 +391,7 @@ def save_user_quiz_attempt(user_id: int, quiz_id: int, doc_id: int, user_answers
         # Fallback to Supabase client
         if supabase:
             print("Using Supabase client fallback for save_user_quiz_attempt")
-            return save_user_quiz_attempt_supabase(user_id, quiz_id, doc_id, user_answers, total_marks, score)
+            return save_user_quiz_attempt_supabase(user_id, quiz_id, user_answers, total_marks, score)
         else:
             return {"success": False, "error": "Database connection failed"}
     
@@ -368,15 +401,19 @@ def save_user_quiz_attempt(user_id: int, quiz_id: int, doc_id: int, user_answers
         # Begin transaction
         cursor.execute("BEGIN;")
         
+        # Use demo user if no user_id provided
+        if not user_id:
+            user_id = "550e8400-e29b-41d4-a716-446655440000"
+        
         # Calculate percentage
         percentage = (score / total_marks) * 100 if total_marks > 0 else 0
         
         # Check if this user has already taken this quiz
         existing_attempt_sql = """
             SELECT user_quiz_id FROM user_quizzes 
-            WHERE user_id = %s AND quiz_id = %s AND doc_id = %s;
+            WHERE user_id = %s AND quiz_id = %s;
         """
-        cursor.execute(existing_attempt_sql, (user_id, quiz_id, doc_id))
+        cursor.execute(existing_attempt_sql, (user_id, quiz_id))
         existing = cursor.fetchone()
         
         if existing:
@@ -385,11 +422,11 @@ def save_user_quiz_attempt(user_id: int, quiz_id: int, doc_id: int, user_answers
             
             update_attempt_sql = """
                 UPDATE user_quizzes 
-                SET taken_date = %s, total_marks = %s, score = %s, percentage = %s
+                SET total_marks = %s, score = %s, percentage = %s, completed_at = NOW()
                 WHERE user_quiz_id = %s;
             """
             cursor.execute(update_attempt_sql, (
-                date.today().isoformat(), total_marks, score, round(percentage, 2), user_quiz_id
+                total_marks, score, round(percentage, 2), user_quiz_id
             ))
             
             # Delete old answers
@@ -399,13 +436,12 @@ def save_user_quiz_attempt(user_id: int, quiz_id: int, doc_id: int, user_answers
         else:
             # Create new attempt
             insert_attempt_sql = """
-                INSERT INTO user_quizzes (user_id, quiz_id, doc_id, taken_date, total_marks, score, percentage)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO user_quizzes (user_id, quiz_id, total_marks, score, percentage)
+                VALUES (%s, %s, %s, %s, %s)
                 RETURNING user_quiz_id;
             """
             cursor.execute(insert_attempt_sql, (
-                user_id, quiz_id, doc_id, date.today().isoformat(), 
-                total_marks, score, round(percentage, 2)
+                user_id, quiz_id, total_marks, score, round(percentage, 2)
             ))
             result = cursor.fetchone()
             user_quiz_id = result['user_quiz_id']
@@ -440,24 +476,27 @@ def save_user_quiz_attempt(user_id: int, quiz_id: int, doc_id: int, user_answers
         cursor.close()
         conn.close()
 
-def save_user_quiz_attempt_supabase(user_id: int, quiz_id: int, doc_id: int, user_answers: List[Dict], 
+def save_user_quiz_attempt_supabase(user_id: str, quiz_id: int, user_answers: List[Dict], 
                                    total_marks: int, score: int) -> Dict[str, Any]:
     """
     Fallback function to save user's quiz attempt using Supabase client
     """
     try:
+        # Use demo user if no user_id provided
+        if not user_id:
+            user_id = "550e8400-e29b-41d4-a716-446655440000"
+        
         # Calculate percentage
         percentage = (score / total_marks) * 100 if total_marks > 0 else 0
         
         # Check if this user has already taken this quiz
-        existing_attempt = supabase.table("user_quizzes").select("user_quiz_id").eq("user_id", user_id).eq("quiz_id", quiz_id).eq("doc_id", doc_id).execute()
+        existing_attempt = supabase.table("user_quizzes").select("user_quiz_id").eq("user_id", user_id).eq("quiz_id", quiz_id).execute()
         
         if existing_attempt.data:
             # Update existing attempt
             user_quiz_id = existing_attempt.data[0]["user_quiz_id"]
             
             update_result = supabase.table("user_quizzes").update({
-                "taken_date": date.today().isoformat(),
                 "total_marks": total_marks,
                 "score": score,
                 "percentage": round(percentage, 2)
@@ -474,8 +513,6 @@ def save_user_quiz_attempt_supabase(user_id: int, quiz_id: int, doc_id: int, use
             insert_result = supabase.table("user_quizzes").insert({
                 "user_id": user_id,
                 "quiz_id": quiz_id,
-                "doc_id": doc_id,
-                "taken_date": date.today().isoformat(),
                 "total_marks": total_marks,
                 "score": score,
                 "percentage": round(percentage, 2)
@@ -508,7 +545,7 @@ def save_user_quiz_attempt_supabase(user_id: int, quiz_id: int, doc_id: int, use
     except Exception as e:
         return {"success": False, "error": f"Supabase error: {str(e)}"}
 
-def get_user_quiz_attempts(user_id: int, limit: int = 50) -> Dict[str, Any]:
+def get_user_quiz_attempts(user_id: str, limit: int = 50) -> Dict[str, Any]:
     """
     Get user's quiz attempts with performance data using raw SQL
     """
@@ -527,7 +564,7 @@ def get_user_quiz_attempts(user_id: int, limit: int = 50) -> Dict[str, Any]:
         attempts_select_sql = """
             SELECT 
                 uq.user_quiz_id,
-                uq.taken_date,
+                uq.completed_at,
                 uq.total_marks,
                 uq.score,
                 uq.percentage,
@@ -537,7 +574,7 @@ def get_user_quiz_attempts(user_id: int, limit: int = 50) -> Dict[str, Any]:
             FROM user_quizzes uq
             JOIN quizzes q ON uq.quiz_id = q.quiz_id
             WHERE uq.user_id = %s
-            ORDER BY uq.taken_date DESC
+            ORDER BY uq.completed_at DESC
             LIMIT %s;
         """
         cursor.execute(attempts_select_sql, (user_id, limit))
@@ -549,7 +586,7 @@ def get_user_quiz_attempts(user_id: int, limit: int = 50) -> Dict[str, Any]:
                 "user_quiz_id": attempt['user_quiz_id'],
                 "quiz_id": attempt['quiz_id'],
                 "topic": attempt['topic'],
-                "taken_date": attempt['taken_date'],
+                "completed_at": attempt['completed_at'],
                 "total_marks": attempt['total_marks'],
                 "score": attempt['score'],
                 "percentage": float(attempt['percentage']) if attempt['percentage'] else 0.0,
@@ -573,7 +610,7 @@ def get_user_quiz_attempts(user_id: int, limit: int = 50) -> Dict[str, Any]:
         cursor.close()
         conn.close()
 
-def get_user_quiz_attempts_supabase(user_id: int, limit: int = 50) -> Dict[str, Any]:
+def get_user_quiz_attempts_supabase(user_id: str, limit: int = 50) -> Dict[str, Any]:
     """
     Fallback function to get user's quiz attempts using Supabase client
     """
@@ -581,12 +618,12 @@ def get_user_quiz_attempts_supabase(user_id: int, limit: int = 50) -> Dict[str, 
         # Get user quiz attempts first
         attempts_result = supabase.table("user_quizzes").select("""
             user_quiz_id,
-            taken_date,
+            completed_at,
             total_marks,
             score,
             percentage,
             quiz_id
-        """).eq("user_id", user_id).order("taken_date", desc=True).limit(limit).execute()
+        """).eq("user_id", user_id).order("completed_at", desc=True).limit(limit).execute()
         
         if not attempts_result.data:
             return {
@@ -608,7 +645,7 @@ def get_user_quiz_attempts_supabase(user_id: int, limit: int = 50) -> Dict[str, 
                     "user_quiz_id": attempt['user_quiz_id'],
                     "quiz_id": attempt['quiz_id'],
                     "topic": quiz_info['topic'],
-                    "taken_date": attempt['taken_date'],
+                    "completed_at": attempt['completed_at'],
                     "total_marks": attempt['total_marks'],
                     "score": attempt['score'],
                     "percentage": float(attempt['percentage']) if attempt['percentage'] else 0.0,
@@ -811,78 +848,7 @@ def get_quiz_attempt_details_supabase(user_quiz_id: int) -> Optional[Dict[str, A
         print(f"Error fetching quiz attempt details with Supabase: {str(e)}")
         return None
 
-def create_dummy_document(title: str, content_type: str = "quiz_generated") -> int:
-    """
-    Create a dummy document record for quiz generation using raw SQL
-    """
-    conn = get_db_connection()
-    if not conn:
-        # Fallback to Supabase client
-        if supabase:
-            print("Using Supabase client fallback for create_dummy_document")
-            return create_dummy_document_supabase(title, content_type)
-        else:
-            return None
-    
-    try:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Create dummy document
-        doc_insert_sql = """
-            INSERT INTO documents (topic, resources, media)
-            VALUES (%s, %s, %s)
-            RETURNING doc_id;
-        """
-        
-        media_data = {
-            "content_type": content_type,
-            "generated_for": "quiz",
-            "created_at": datetime.now().isoformat()
-        }
-        
-        cursor.execute(doc_insert_sql, (
-            title[:255],
-            json.dumps([]),  # Empty resources array
-            json.dumps(media_data)  # Media as JSON
-        ))
-        
-        result = cursor.fetchone()
-        doc_id = result['doc_id'] if result else None
-        
-        return doc_id
-        
-    except Exception as e:
-        print(f"Error creating dummy document: {str(e)}")
-        return None
-    finally:
-        cursor.close()
-        conn.close()
-
-def create_dummy_document_supabase(title: str, content_type: str = "quiz_generated") -> int:
-    """
-    Fallback function to create dummy document using Supabase client
-    """
-    try:
-        media_data = {
-            "content_type": content_type,
-            "generated_for": "quiz",
-            "created_at": datetime.now().isoformat()
-        }
-        
-        result = supabase.table("documents").insert({
-            "topic": title[:255],
-            "resources": [],  # Empty resources array
-            "media": media_data  # Media as JSON
-        }).execute()
-        
-        if result.data:
-            return result.data[0]["doc_id"]
-        else:
-            return None
-        
-    except Exception as e:
-        print(f"Error creating dummy document with Supabase: {str(e)}")
-        return None
+# Note: create_dummy_document functions removed as they're not needed with new schema
 
 if __name__ == "__main__":
     # Test the functions

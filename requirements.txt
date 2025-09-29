@@ -9,3 +9,8 @@ requests==2.31.0
 beautifulsoup4==4.12.2
 PyPDF2==3.0.1
 python-docx==1.1.0
+google-cloud-documentai==2.29.0
+google-auth==2.29.0
+google-api-python-client==2.155.0
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0

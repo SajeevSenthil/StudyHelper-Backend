@@ -51,7 +51,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
+*.sql
 # IDE
 .vscode/
 .idea/
