@@ -58,7 +58,7 @@ def get_db_connection():
 
 def save_quiz_to_database(topic: str, questions_data: List[Dict], performance_report: str = None, user_id: str = None) -> Dict[str, Any]:
     """
-    Save a complete quiz to the database with all questions and options using raw SQL
+    Save a complete quiz to the database using stored procedure for better performance
     """
     conn = get_db_connection()
     if not conn:
@@ -68,6 +68,45 @@ def save_quiz_to_database(topic: str, questions_data: List[Dict], performance_re
             return save_quiz_to_database_supabase(topic, questions_data, performance_report, user_id)
         else:
             return {"success": False, "error": "Database connection failed and no Supabase fallback available"}
+    
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Use demo user if no user_id provided
+        if not user_id:
+            user_id = "550e8400-e29b-41d4-a716-446655440000"
+        
+        # Convert questions data to JSONB format
+        questions_json = json.dumps(questions_data)
+        
+        # Call stored procedure for creating complete quiz
+        cursor.execute("""
+            SELECT create_complete_quiz(%s, %s, %s, %s::jsonb) as result;
+        """, (user_id, topic[:255], performance_report, questions_json))
+        
+        result = cursor.fetchone()['result']
+        
+        # Return the result from stored procedure
+        return result
+        
+    except Exception as e:
+        print(f"Error calling stored procedure: {str(e)}")
+        # Fallback to original manual method if stored procedure fails
+        return save_quiz_to_database_manual(topic, questions_data, performance_report, user_id, conn)
+    finally:
+        cursor.close()
+        conn.close()
+
+def save_quiz_to_database_manual(topic: str, questions_data: List[Dict], performance_report: str = None, user_id: str = None, conn=None) -> Dict[str, Any]:
+    """
+    Fallback manual method for saving quiz (original implementation)
+    """
+    should_close_conn = False
+    if not conn:
+        conn = get_db_connection()
+        should_close_conn = True
+        if not conn:
+            return {"success": False, "error": "Database connection failed"}
     
     try:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -137,7 +176,8 @@ def save_quiz_to_database(topic: str, questions_data: List[Dict], performance_re
         return {"success": False, "error": f"Database error: {str(e)}"}
     finally:
         cursor.close()
-        conn.close()
+        if should_close_conn:
+            conn.close()
 
 def save_quiz_to_database_supabase(topic: str, questions_data: List[Dict], performance_report: str = None, user_id: str = None) -> Dict[str, Any]:
     """
@@ -384,7 +424,7 @@ def get_quiz_by_id_supabase(quiz_id: int) -> Optional[Dict[str, Any]]:
 def save_user_quiz_attempt(user_id: str, quiz_id: int, user_answers: List[Dict], 
                           total_marks: int, score: int) -> Dict[str, Any]:
     """
-    Save user's quiz attempt and answers using raw SQL
+    Save user's quiz attempt and answers using stored procedure for better performance
     """
     conn = get_db_connection()
     if not conn:
@@ -393,6 +433,46 @@ def save_user_quiz_attempt(user_id: str, quiz_id: int, user_answers: List[Dict],
             print("Using Supabase client fallback for save_user_quiz_attempt")
             return save_user_quiz_attempt_supabase(user_id, quiz_id, user_answers, total_marks, score)
         else:
+            return {"success": False, "error": "Database connection failed"}
+    
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Use demo user if no user_id provided
+        if not user_id:
+            user_id = "550e8400-e29b-41d4-a716-446655440000"
+        
+        # Convert answers to JSONB format
+        answers_json = json.dumps(user_answers)
+        
+        # Call stored procedure for saving quiz attempt
+        cursor.execute("""
+            SELECT save_quiz_attempt(%s, %s, %s::jsonb, %s, %s) as result;
+        """, (user_id, quiz_id, answers_json, total_marks, score))
+        
+        result = cursor.fetchone()['result']
+        
+        # Return the result from stored procedure
+        return result
+        
+    except Exception as e:
+        print(f"Error calling stored procedure for quiz attempt: {str(e)}")
+        # Fallback to original manual method if stored procedure fails
+        return save_user_quiz_attempt_manual(user_id, quiz_id, user_answers, total_marks, score, conn)
+    finally:
+        cursor.close()
+        conn.close()
+
+def save_user_quiz_attempt_manual(user_id: str, quiz_id: int, user_answers: List[Dict], 
+                                 total_marks: int, score: int, conn=None) -> Dict[str, Any]:
+    """
+    Fallback manual method for saving quiz attempt (original implementation)
+    """
+    should_close_conn = False
+    if not conn:
+        conn = get_db_connection()
+        should_close_conn = True
+        if not conn:
             return {"success": False, "error": "Database connection failed"}
     
     try:
@@ -474,7 +554,8 @@ def save_user_quiz_attempt(user_id: str, quiz_id: int, user_answers: List[Dict],
         return {"success": False, "error": f"Database error: {str(e)}"}
     finally:
         cursor.close()
-        conn.close()
+        if should_close_conn:
+            conn.close()
 
 def save_user_quiz_attempt_supabase(user_id: str, quiz_id: int, user_answers: List[Dict], 
                                    total_marks: int, score: int) -> Dict[str, Any]:
@@ -847,6 +928,280 @@ def get_quiz_attempt_details_supabase(user_quiz_id: int) -> Optional[Dict[str, A
     except Exception as e:
         print(f"Error fetching quiz attempt details with Supabase: {str(e)}")
         return None
+
+# ============================================================================
+# ANALYTICS FUNCTIONS USING STORED PROCEDURES
+# ============================================================================
+
+def get_quiz_analytics(quiz_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Get detailed analytics for a quiz using stored procedure
+    """
+    conn = get_db_connection()
+    if not conn:
+        # Fallback to Supabase client
+        if supabase:
+            print("Using Supabase client fallback for get_quiz_analytics")
+            return get_quiz_analytics_supabase(quiz_id)
+        else:
+            return None
+    
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Call stored procedure for quiz analytics
+        cursor.execute("SELECT get_quiz_analytics(%s) as analytics;", (quiz_id,))
+        result = cursor.fetchone()
+        
+        if result and result['analytics']:
+            return result['analytics']
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error getting quiz analytics: {str(e)}")
+        return None
+    finally:
+        cursor.close()
+        conn.close()
+
+def get_quiz_analytics_supabase(quiz_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Fallback function to get quiz analytics using Supabase client
+    """
+    try:
+        # Get basic quiz info
+        quiz_result = supabase.table("quizzes").select("quiz_id, topic").eq("quiz_id", quiz_id).execute()
+        if not quiz_result.data:
+            return None
+        
+        # Get user attempts for this quiz
+        attempts_result = supabase.table("user_quizzes").select(
+            "user_quiz_id, score, total_marks, percentage, user_id"
+        ).eq("quiz_id", quiz_id).execute()
+        
+        attempts = attempts_result.data
+        total_attempts = len(attempts)
+        
+        if total_attempts == 0:
+            return {
+                "quiz_id": quiz_id,
+                "total_attempts": 0,
+                "average_score": 0,
+                "highest_score": 0,
+                "lowest_score": 0
+            }
+        
+        # Calculate statistics
+        percentages = [float(attempt['percentage']) for attempt in attempts]
+        
+        return {
+            "quiz_id": quiz_id,
+            "total_attempts": total_attempts,
+            "average_score": round(sum(percentages) / len(percentages), 2),
+            "highest_score": max(percentages),
+            "lowest_score": min(percentages),
+            "unique_users": len(set(attempt['user_id'] for attempt in attempts))
+        }
+        
+    except Exception as e:
+        print(f"Error getting quiz analytics with Supabase: {str(e)}")
+        return None
+
+def get_user_performance_summary(user_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Get comprehensive user performance summary using stored procedure
+    """
+    conn = get_db_connection()
+    if not conn:
+        # Fallback to Supabase client
+        if supabase:
+            print("Using Supabase client fallback for get_user_performance_summary")
+            return get_user_performance_summary_supabase(user_id)
+        else:
+            return None
+    
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Call stored procedure for user performance summary
+        cursor.execute("SELECT get_user_performance_summary(%s) as performance;", (user_id,))
+        result = cursor.fetchone()
+        
+        if result and result['performance']:
+            return result['performance']
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error getting user performance summary: {str(e)}")
+        return None
+    finally:
+        cursor.close()
+        conn.close()
+
+def get_user_performance_summary_supabase(user_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fallback function to get user performance summary using Supabase client
+    """
+    try:
+        # Get all user quiz attempts
+        attempts_result = supabase.table("user_quizzes").select(
+            "user_quiz_id, quiz_id, score, total_marks, percentage, completed_at"
+        ).eq("user_id", user_id).order("completed_at", desc=True).execute()
+        
+        attempts = attempts_result.data
+        
+        if not attempts:
+            return {
+                "user_id": user_id,
+                "total_quizzes": 0,
+                "average_score": 0,
+                "highest_score": 0,
+                "total_questions_answered": 0,
+                "correct_answers": 0,
+                "accuracy_rate": 0
+            }
+        
+        # Calculate statistics
+        total_quizzes = len(attempts)
+        percentages = [float(attempt['percentage']) for attempt in attempts]
+        total_questions = sum(attempt['total_marks'] for attempt in attempts)
+        correct_answers = sum(attempt['score'] for attempt in attempts)
+        
+        return {
+            "user_id": user_id,
+            "total_quizzes": total_quizzes,
+            "average_score": round(sum(percentages) / len(percentages), 2),
+            "highest_score": max(percentages),
+            "total_questions_answered": total_questions,
+            "correct_answers": correct_answers,
+            "accuracy_rate": round((correct_answers / total_questions) * 100, 2) if total_questions > 0 else 0,
+            "recent_attempts": attempts[:5]  # Last 5 attempts
+        }
+        
+    except Exception as e:
+        print(f"Error getting user performance summary with Supabase: {str(e)}")
+        return None
+
+def search_documents_advanced(user_id: str, search_term: str, limit: int = 20, offset: int = 0) -> Optional[Dict[str, Any]]:
+    """
+    Advanced document search using stored procedure with full-text search
+    """
+    conn = get_db_connection()
+    if not conn:
+        # Fallback to basic search
+        if supabase:
+            print("Using Supabase client fallback for search_documents_advanced")
+            return search_documents_basic_supabase(user_id, search_term, limit, offset)
+        else:
+            return None
+    
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Call stored procedure for advanced search
+        cursor.execute("""
+            SELECT search_documents(%s, %s, %s, %s) as search_results;
+        """, (user_id, search_term, limit, offset))
+        
+        result = cursor.fetchone()
+        
+        if result and result['search_results']:
+            return result['search_results']
+        
+        return {"total_count": 0, "documents": []}
+        
+    except Exception as e:
+        print(f"Error in advanced document search: {str(e)}")
+        return None
+    finally:
+        cursor.close()
+        conn.close()
+
+def search_documents_basic_supabase(user_id: str, search_term: str, limit: int = 20, offset: int = 0) -> Optional[Dict[str, Any]]:
+    """
+    Basic document search using Supabase client (fallback)
+    """
+    try:
+        # Simple text search in topic and summary
+        documents_result = supabase.table("documents").select(
+            "doc_id, topic, summary, keywords, created_at"
+        ).eq("user_id", user_id).or_(
+            f"topic.ilike.%{search_term}%,summary.ilike.%{search_term}%,keywords.ilike.%{search_term}%"
+        ).range(offset, offset + limit - 1).execute()
+        
+        documents = documents_result.data
+        
+        return {
+            "total_count": len(documents),
+            "documents": documents
+        }
+        
+    except Exception as e:
+        print(f"Error in basic document search with Supabase: {str(e)}")
+        return None
+
+def cleanup_old_data(days_old: int = 90) -> Dict[str, Any]:
+    """
+    Cleanup old quiz attempts using stored procedure
+    """
+    conn = get_db_connection()
+    if not conn:
+        return {"success": False, "error": "Database connection failed"}
+    
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Call stored procedure for cleanup
+        cursor.execute("SELECT cleanup_old_quiz_attempts(%s) as cleanup_result;", (days_old,))
+        result = cursor.fetchone()
+        
+        if result and result['cleanup_result']:
+            return result['cleanup_result']
+        
+        return {"success": False, "error": "No result from cleanup procedure"}
+        
+    except Exception as e:
+        return {"success": False, "error": f"Cleanup error: {str(e)}"}
+    finally:
+        cursor.close()
+        conn.close()
+
+# ============================================================================
+# DOCUMENT MANAGEMENT WITH STORED PROCEDURES
+# ============================================================================
+
+def save_document_with_validation(user_id: str, topic: str, content: str, 
+                                 summary: str = None, keywords: str = None, 
+                                 file_url: str = None) -> Dict[str, Any]:
+    """
+    Save document with validation using stored procedure
+    """
+    conn = get_db_connection()
+    if not conn:
+        return {"success": False, "error": "Database connection failed"}
+    
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Call stored procedure for document validation and saving
+        cursor.execute("""
+            SELECT save_document_with_validation(%s, %s, %s, %s, %s, %s) as save_result;
+        """, (user_id, topic, content, summary, keywords, file_url))
+        
+        result = cursor.fetchone()
+        
+        if result and result['save_result']:
+            return result['save_result']
+        
+        return {"success": False, "error": "No result from save procedure"}
+        
+    except Exception as e:
+        return {"success": False, "error": f"Document save error: {str(e)}"}
+    finally:
+        cursor.close()
+        conn.close()
 
 # Note: create_dummy_document functions removed as they're not needed with new schema
 
