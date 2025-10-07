@@ -324,7 +324,7 @@ def summarize_text(text: str, max_length: int = 200) -> str:
                     "content": f"Please provide a concise summary of the following text in approximately {max_length} words or less:\n\n{text}"
                 }
             ],
-            max_tokens=500,
+            max_tokens=1500,
             temperature=0.3
         )
         
