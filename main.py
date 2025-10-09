@@ -16,6 +16,10 @@ import json
 import re
 from datetime import datetime
 from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Import our custom modules
 from summarizer import (summarize_text, extract_keywords, summarize_and_save, 
