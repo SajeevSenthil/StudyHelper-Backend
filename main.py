@@ -120,7 +120,8 @@ app.add_middleware(
         "http://localhost:3000", 
         "http://localhost:3001",  # Next.js default ports
         "https://study-helper-frontend-s3ts-pmj5b0aec.vercel.app", 
-        "https://study-helper-frontend-s3ts-heyw6ggqn.vercel.app",  # Production frontend
+        "https://study-helper-frontend-s3ts-heyw6ggqn.vercel.app", 
+        "https://study-helper-frontend.vercel.app",# Production frontend
         "https://*.vercel.app"  # All Vercel preview deployments
     ],
     allow_credentials=True,
