@@ -13,7 +13,9 @@ from datetime import datetime
 import jwt
 import jwt
 import json
+import re
 from datetime import datetime
+from openai import OpenAI
 
 # Import our custom modules
 from summarizer import (summarize_text, extract_keywords, summarize_and_save, 
@@ -40,57 +42,51 @@ def get_user_from_token(authorization: str = Header(None)) -> Optional[str]:
     """Extract user ID from Supabase JWT token"""
     if not authorization:
         return None
-    
+
     try:
-        # Remove 'Bearer ' prefix
         token = authorization.replace('Bearer ', '') if authorization.startswith('Bearer ') else authorization
-        
-        # For development, we'll decode without verification
-        # In production, you should verify with your JWT secret
         decoded = jwt.decode(token, options={"verify_signature": False})
-        user_id = decoded.get('sub')  # 'sub' contains the user ID in Supabase JWTs
-        
+        user_id = decoded.get('sub')
         print(f"[DEBUG] Extracted user ID from token: {user_id}")
         return user_id
-        
     except Exception as e:
         print(f"[DEBUG] Token decode error: {str(e)}")
         return None
 
+
 def get_current_user_dev(authorization: str = Header(None)) -> str:
     """Get current user ID, with fallback for development"""
     user_id = get_user_from_token(authorization)
-    
+
     if not user_id:
         print("[DEBUG] No valid token found, using demo user for development")
-        # For development/demo purposes, return a demo user ID
-        # This should be a valid UUID that exists in your auth.users table
         return "550e8400-e29b-41d4-a716-446655440000"
-    
+
     return user_id
+
 
 # Authentication utilities
 def verify_supabase_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     """Verify Supabase JWT token and extract user information"""
     if not credentials:
         return None
-    
+
     try:
         # Get the token from the Authorization header
         token = credentials.credentials
-        
+
         # Use Supabase client to verify the token
         user_response = supabase.auth.get_user(token)
-        
-        if user_response.user:
+
+        if getattr(user_response, 'user', None):
             return {
                 "user_id": user_response.user.id,
                 "email": user_response.user.email,
-                "token": token
+                "token": token,
             }
         else:
             return None
-            
+
     except Exception as e:
         print(f"Token verification error: {str(e)}")
         return None
@@ -100,7 +96,7 @@ def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depen
     user = verify_supabase_token(credentials)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
-    
+
     # Ensure user_id is treated as UUID string
     user["user_id"] = str(user["user_id"])
     return user
@@ -125,26 +121,76 @@ app.add_middleware(
 # Configuration
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
 
-# Pydantic models for request/response
+# Pydantic models for request/response payloads
 class TextSummarizeRequest(BaseModel):
     text: str
     max_length: Optional[int] = 200
 
+
 class ResourceRequest(BaseModel):
     text: str
-    doc_id: Optional[int] = None  # Optional document ID to save resources to
+    doc_id: Optional[int] = None
+
 
 class SaveSessionRequest(BaseModel):
-    user_id: Optional[int] = 1  # Default user for now
+    user_id: Optional[int] = 1
     topic: str
     original_content: str
     summary: str
     resources: List[str]
 
+
 class QuizGenerateRequest(BaseModel):
     topic: Optional[str] = None
     content: Optional[str] = None
-    quiz_type: str  # "topic" or "document"
+    quiz_type: str
+
+
+class QuizGenerationRequest(BaseModel):
+    doc_id: Optional[int] = None
+    topic: Optional[str] = None
+    num_questions: int = 10
+
+
+class QuizSubmissionRequest(BaseModel):
+    quiz_id: int
+    user_id: Optional[int] = 1
+    answers: List[Dict[str, Any]]
+    doc_id: Optional[int] = None
+    quiz_title: Optional[str] = None
+
+
+class SummarizeResponse(BaseModel):
+    summary: str
+    keywords: str
+    original_length: int
+    summary_length: int
+
+
+class ResourceResponse(BaseModel):
+    resources: List[Dict[str, str]]
+    topic: str
+
+
+class DownloadSummaryRequest(BaseModel):
+    text: str
+    topic: Optional[str] = None
+    user_id: Optional[int] = 1
+    max_length: Optional[int] = 200
+
+
+class DownloadSummaryResponse(BaseModel):
+    success: bool
+    summary: Optional[str] = None
+    keywords: Optional[str] = None
+    topic: Optional[str] = None
+    resources: Optional[List[str]] = None
+    doc_id: Optional[int] = None
+    message: str
+    original_length: Optional[int] = None
+    summary_length: Optional[int] = None
+    timestamp: Optional[str] = None
+    error: Optional[str] = None
 
 class QuizSubmissionRequest(BaseModel):
     quiz_id: int
@@ -300,6 +346,45 @@ def extract_text_from_txt(file_content: bytes) -> str:
             return file_content.decode('latin-1').strip()
         except:
             return ""
+
+
+def _build_user_summaries_response(user_id: str, limit: Optional[int]) -> Dict[str, Any]:
+    """Format summaries payload for the requesting user."""
+
+    print(f"[DEBUG] Getting documents for user: {user_id}")
+
+    documents = get_user_documents(user_id, limit)
+    if limit is not None and documents:
+        documents = documents[:limit]
+
+    if not documents:
+        return {
+            "success": True,
+            "summaries": [],
+            "message": "No documents found",
+        }
+
+    summaries = []
+    for doc in documents:
+        summary_text = doc.get("summary", "") or ""
+        original_content = doc.get("original_content") or doc.get("content", "") or ""
+        summaries.append({
+            "doc_id": doc.get("doc_id"),
+            "topic": doc.get("topic"),
+            "summary": summary_text,
+            "content": original_content,
+            "file_url": doc.get("file_url"),
+            "created_at": doc.get("created_at", ""),
+            "summary_length": len(summary_text),
+            "content_length": len(original_content),
+        })
+
+    return {
+        "success": True,
+        "summaries": summaries,
+        "total_count": len(summaries),
+    }
+
 
 # API Routes
 @app.get("/")
@@ -601,100 +686,29 @@ async def create_demo_user():
         }
 
 @app.post("/save")
+@app.post("/api/save")
 async def save_session(request: SaveSessionRequest, current_user: str = Depends(get_current_user_dev)):
-    """Save a complete study session to documents table"""
+    """Save a complete study session using Supabase with SQLite fallback."""
     try:
         if not all([request.topic, request.original_content, request.summary]):
             raise HTTPException(status_code=400, detail="Missing required fields: topic, original_content, or summary")
-        
+
         print(f"[DEBUG] Saving document for user: {current_user}, topic: {request.topic}")
-        
-        # Save to documents table with the authenticated user ID
-        try:
-            doc_result = supabase.table("documents").insert({
-                "user_id": current_user,
-                "topic": request.topic,
-                "content": request.original_content,
-                "summary": request.summary,
-                "file_url": None
-            }).execute()
-            
-            if doc_result.data:
-                doc_id = doc_result.data[0]["doc_id"]
-                print(f"[DEBUG] Document saved successfully with ID: {doc_id}")
-                return {
-                    "success": True,
-                    "message": "Document saved successfully", 
-                    "doc_id": doc_id,
-                    "timestamp": datetime.now().isoformat()
-                }
-            else:
-                raise HTTPException(status_code=500, detail="Failed to save document - no data returned")
-                
-        except Exception as db_error:
-            print(f"[ERROR] Database error: {str(db_error)}")
-            # If that fails too, let's check what exactly is the constraint
-            error_msg = str(db_error)
-            if "user_id" in error_msg.lower() and "not null" in error_msg.lower():
-                # The user_id column doesn't allow NULL, so we need to provide a value
-                print("[DEBUG] user_id column requires a value, will try with NULL UUID")
-                try:
-                    # Try with a NULL UUID approach - insert a special "anonymous" user ID
-                    doc_result = supabase.table("documents").insert({
-                        "user_id": None,  # Try explicit NULL first
-                        "topic": request.topic,
-                        "content": request.original_content,
-                        "summary": request.summary,
-                        "file_url": None
-                    }).execute()
-                    
-                    if doc_result.data:
-                        doc_id = doc_result.data[0]["doc_id"]
-                        return {
-                            "success": True,
-                            "message": "Document saved successfully", 
-                            "doc_id": doc_id,
-                            "timestamp": datetime.now().isoformat()
-                        }
-                except Exception as null_error:
-                    print(f"[DEBUG] NULL approach failed: {str(null_error)}")
-            
-            raise HTTPException(status_code=500, detail=f"Database error: {str(db_error)}")
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[ERROR] Save session failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Save session failed: {str(e)}")
-        keywords = extract_keywords(request.summary) if request.summary else ""
-        keywords = extract_keywords(request.summary) if request.summary else ""
-        
-        # Save directly to documents table using your schema
-        try:
-            doc_result = supabase.table("documents").insert({
-                "user_id": user_id,
-                "topic": request.topic,
-                "content": request.original_content,
-                "summary": request.summary,
-                "file_url": None  # For text input, no file URL needed
-            }).execute()
-            
-            if doc_result.data:
-                doc_id = doc_result.data[0]["doc_id"]
-                print(f"[DEBUG] Document saved successfully with ID: {doc_id}")
-                return {
-                    "success": True,
-                    "message": "Document saved successfully", 
-                    "doc_id": doc_id,
-                    "timestamp": datetime.now().isoformat()
-                }
-            else:
-                raise HTTPException(status_code=500, detail="Failed to save document to database")
-                
-        except Exception as db_error:
-            print(f"[ERROR] Database error: {str(db_error)}")
-            raise HTTPException(status_code=500, detail=f"Database error: {str(db_error)}")
-        
+
+        result = save_document_session(
+            user_id=current_user,
+            topic=request.topic,
+            original_content=request.original_content,
+            summary=request.summary,
+            resources=request.resources or [],
+        )
+
+        if result.get("success"):
+            return result
+
+        message = result.get("message", "Failed to save document")
+        raise HTTPException(status_code=500, detail=message)
+
     except HTTPException:
         raise
     except Exception as e:
@@ -702,117 +716,55 @@ async def save_session(request: SaveSessionRequest, current_user: str = Depends(
         raise HTTPException(status_code=500, detail=f"Save session failed: {str(e)}")
 
 @app.get("/my-summaries")
+@app.get("/api/my-summaries")
 async def get_my_summaries(current_user: str = Depends(get_current_user_dev), limit: Optional[int] = 50):
-    """Get user's saved documents using your schema"""
+    """Get user's saved documents using the shared persistence layer."""
     try:
-        print(f"[DEBUG] Getting documents for user: {current_user}")
-        
-        # Query documents table directly using your schema
-        documents_result = supabase.table("documents").select("*").eq("user_id", current_user).order("doc_id", desc=True).limit(limit).execute()
-        
-        if not documents_result.data:
-            return {
-                "success": True,
-                "summaries": [],
-                "message": "No documents found"
-            }
-        
-        # Format the documents for frontend
-        summaries = []
-        for doc in documents_result.data:
-            summaries.append({
-                "doc_id": doc["doc_id"],
-                "topic": doc["topic"],
-                "summary": doc["summary"],
-                "content": doc["content"],
-                "file_url": doc["file_url"],
-                "created_at": doc.get("created_at", ""),
-                "summary_length": len(doc["summary"]) if doc["summary"] else 0,
-                "content_length": len(doc["content"]) if doc["content"] else 0
-            })
-        
-        return {
-            "success": True,
-            "summaries": summaries,
-            "total_count": len(summaries)
-        }
-        
+        return _build_user_summaries_response(current_user, limit)
     except Exception as e:
         print(f"[ERROR] Get summaries failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve summaries: {str(e)}")
 
+
 @app.get("/my-documents")
 async def get_my_documents():
-    """Get user's documents from your schema"""
+    """Get documents for the demo user using the shared persistence layer."""
     try:
-        # Use the same demo user ID (service key bypasses RLS)
         user_id = "550e8400-e29b-41d4-a716-446655440000"
-            
         print(f"[DEBUG] Getting documents for user: {user_id}")
-        
-        # Get documents from your schema
-        documents_result = supabase.table("documents").select("*").eq("user_id", user_id).order("doc_id", desc=True).execute()
-        
-        if not documents_result.data:
+
+        documents = get_user_documents(user_id)
+        if not documents:
             return {
                 "success": True,
                 "documents": [],
-                "message": "No documents found"
+                "message": "No documents found",
             }
-        
-        # Format documents for frontend
-        documents = []
-        for doc in documents_result.data:
-            documents.append({
-                "doc_id": doc["doc_id"],
-                "topic": doc["topic"],
-                "summary": doc["summary"][:200] + "..." if doc["summary"] and len(doc["summary"]) > 200 else doc["summary"],
-                "content_preview": doc["content"][:300] + "..." if doc["content"] and len(doc["content"]) > 300 else doc["content"],
-                "file_url": doc["file_url"],
+
+        formatted_documents = []
+        for doc in documents:
+            summary_text = doc.get("summary", "") or ""
+            original_content = doc.get("original_content") or doc.get("content", "") or ""
+            formatted_documents.append({
+                "doc_id": doc.get("doc_id"),
+                "topic": doc.get("topic"),
+                "summary": summary_text[:200] + "..." if len(summary_text) > 200 else summary_text,
+                "content_preview": original_content[:300] + "..." if len(original_content) > 300 else original_content,
+                "file_url": doc.get("file_url"),
                 "created_at": doc.get("created_at", ""),
-                "summary_length": len(doc["summary"]) if doc["summary"] else 0,
-                "content_length": len(doc["content"]) if doc["content"] else 0
+                "summary_length": len(summary_text),
+                "content_length": len(original_content),
             })
-        
+
         return {
             "success": True,
-            "documents": documents,
-            "total_count": len(documents)
+            "documents": formatted_documents,
+            "total_count": len(formatted_documents),
         }
-        
+
     except Exception as e:
         print(f"[ERROR] Get documents failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve documents: {str(e)}")
-
-@app.delete("/documents/{doc_id}")
-async def delete_document_endpoint(doc_id: int, current_user: str = Depends(get_current_user_dev)):
-    """Delete a document by ID"""
-    try:
-        print(f"[DEBUG] Deleting document {doc_id} for user: {current_user}")
-        
-        # First check if document belongs to user
-        doc_result = supabase.table("documents").select("*").eq("doc_id", doc_id).eq("user_id", current_user).execute()
-        
-        if not doc_result.data:
-            raise HTTPException(status_code=404, detail="Document not found or access denied")
-        
-        # Delete the document
-        delete_result = supabase.table("documents").delete().eq("doc_id", doc_id).eq("user_id", current_user).execute()
-        
-        if delete_result.data:
-            return {
-                "success": True,
-                "message": "Document deleted successfully",
-                "deleted_doc_id": doc_id
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Failed to delete document")
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[ERROR] Delete document failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete document: {str(e)}")
 
 @app.get("/summary-file/{filename}")
 async def download_summary_file(filename: str):
@@ -941,10 +893,12 @@ async def get_saved_summary_detail(doc_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve summary: {str(e)}")
 
 @app.delete("/documents/{doc_id}")
-async def delete_document_endpoint(doc_id: int, user_id: Optional[int] = None):
+@app.delete("/api/documents/{doc_id}")
+async def delete_document_endpoint(doc_id: int, current_user: str = Depends(get_current_user_dev)):
     """Delete a specific document by ID using Supabase client"""
     try:
-        result = delete_document(doc_id, user_id)  # Use Supabase version
+        print(f"[DEBUG] Deleting document {doc_id} for user: {current_user}")
+        result = delete_document(doc_id, current_user)  # Pass authenticated user
         
         if result["success"]:
             return {
@@ -957,6 +911,7 @@ async def delete_document_endpoint(doc_id: int, user_id: Optional[int] = None):
     except HTTPException:
         raise
     except Exception as e:
+        print(f"[ERROR] Delete document failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete document: {str(e)}")
 
 # QUIZ ENDPOINTS
@@ -1057,6 +1012,238 @@ async def generate_quiz_from_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File quiz generation failed: {str(e)}")
 
+@app.post("/api/generate-quiz")
+async def generate_quiz_api(request: QuizGenerationRequest, current_user: str = Depends(get_current_user_dev)):
+    """
+    Generate a quiz following the complete StudyHelper specification.
+    Supports both document-based and topic-based quiz generation.
+    """
+    try:
+        print(f"[DEBUG] Quiz generation request: {request}")
+        print(f"[DEBUG] User ID: {current_user}")
+        
+        # STEP 1 - AUTHENTICATION & AUTHORIZATION
+        # User is already authenticated via get_current_user_dev dependency
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        
+        # STEP 2 - FETCH DOCUMENT CONTENT (if doc_id provided)
+        document_content = None
+        topic = request.topic
+        
+        if request.doc_id:
+            print(f"[DEBUG] Fetching document with ID: {request.doc_id}")
+            try:
+                # Query document with RLS automatically filtering by user_id
+                doc_result = supabase.table("documents").select(
+                    "content, topic, summary"
+                ).eq("doc_id", request.doc_id).execute()
+                
+                if not doc_result.data:
+                    raise HTTPException(status_code=404, detail="Document not found or access denied")
+                
+                document = doc_result.data[0]
+                document_content = document.get("content") or document.get("summary", "")
+                topic = topic or document.get("topic", "General Knowledge")
+                
+                print(f"[DEBUG] Document fetched successfully. Topic: {topic}")
+                
+            except Exception as e:
+                print(f"[DEBUG] Document fetch error: {str(e)}")
+                raise HTTPException(status_code=404, detail="Document not found or access denied")
+        
+        # Validate we have either topic or document content
+        if not topic and not document_content:
+            raise HTTPException(status_code=400, detail="Either topic or doc_id must be provided")
+        
+        if not topic:
+            topic = "General Knowledge"
+        
+        # STEP 3 - CALL GPT-4O MINI API
+        print(f"[DEBUG] Generating {request.num_questions} questions for topic: {topic}")
+        
+        from openai import OpenAI
+        import json
+        import re
+        
+        # Initialize OpenAI client
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+        
+        client = OpenAI(api_key=openai_api_key)
+        
+        # Construct prompt according to specifications
+        if document_content:
+            prompt = f"""Generate {request.num_questions} multiple-choice questions on topic: {topic}. Based on this content: {document_content}. 
+
+Requirements: 
+- Each question has exactly 4 options (A, B, C, D)
+- Only ONE correct answer
+- Plausible distractors (not obviously wrong)
+- Vary difficulty levels (easy, medium, hard)
+- Clear and unambiguous questions
+
+Return ONLY valid JSON array with no additional text or markdown:
+[{{"question_text": "What is...?", "option_a": "First option", "option_b": "Second option", "option_c": "Third option", "option_d": "Fourth option", "correct_option": "A", "marks": 1}}]"""
+        else:
+            prompt = f"""Generate {request.num_questions} multiple-choice questions on topic: {topic}. 
+
+Requirements:
+- Each question has exactly 4 options (A, B, C, D)
+- Only ONE correct answer
+- Plausible distractors (not obviously wrong)
+- Vary difficulty levels (easy, medium, hard)
+- Clear and unambiguous questions
+
+Return ONLY valid JSON array with no additional text or markdown:
+[{{"question_text": "What is...?", "option_a": "First option", "option_b": "Second option", "option_c": "Third option", "option_d": "Fourth option", "correct_option": "A", "marks": 1}}]"""
+        
+        # Call OpenAI API with retry logic
+        max_retries = 2
+        questions_data = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                print(f"[DEBUG] OpenAI API call attempt {attempt + 1}")
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are an expert educational content creator."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7
+                )
+                
+                # Parse response and clean markdown formatting
+                ai_response = response.choices[0].message.content.strip()
+                print(f"[DEBUG] AI Response (first 200 chars): {ai_response[:200]}")
+                
+                # Remove markdown code blocks if present
+                ai_response = re.sub(r'```json\s*', '', ai_response)
+                ai_response = re.sub(r'```\s*$', '', ai_response)
+                ai_response = ai_response.strip()
+                
+                # Parse JSON
+                questions_data = json.loads(ai_response)
+                
+                # Validate structure
+                if not isinstance(questions_data, list) or len(questions_data) == 0:
+                    raise ValueError("Invalid response structure")
+                
+                # Validate each question
+                for q in questions_data:
+                    required_fields = ["question_text", "option_a", "option_b", "option_c", "option_d", "correct_option"]
+                    for field in required_fields:
+                        if field not in q:
+                            raise ValueError(f"Missing field: {field}")
+                    
+                    if q["correct_option"] not in ["A", "B", "C", "D"]:
+                        raise ValueError(f"Invalid correct_option: {q['correct_option']}")
+                
+                print(f"[DEBUG] Successfully generated {len(questions_data)} questions")
+                break
+                
+            except Exception as e:
+                print(f"[DEBUG] AI generation attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries:
+                    raise HTTPException(status_code=500, detail=f"AI generation failed after {max_retries + 1} attempts: {str(e)}")
+        
+        # STEP 4 - BEGIN DATABASE TRANSACTION
+        print("[DEBUG] Starting database transaction")
+        
+        # Using Supabase transactions with try/catch for rollback
+        quiz_id = None
+        try:
+            # STEP 5 - CREATE QUIZ RECORD
+            quiz_insert_result = supabase.table("quizzes").insert({
+                "user_id": current_user,
+                "topic": topic
+            }).execute()
+            
+            if not quiz_insert_result.data:
+                raise Exception("Failed to create quiz record")
+            
+            quiz_id = quiz_insert_result.data[0]["quiz_id"]
+            print(f"[DEBUG] Created quiz with ID: {quiz_id}")
+            
+            # STEP 6 - LOOP THROUGH EACH AI-GENERATED QUESTION
+            question_order = 1
+            
+            for question_data in questions_data:
+                # a) Insert Question
+                question_insert_result = supabase.table("questions").insert({
+                    "question_text": question_data["question_text"]
+                }).execute()
+                
+                if not question_insert_result.data:
+                    raise Exception(f"Failed to insert question: {question_data['question_text']}")
+                
+                question_id = question_insert_result.data[0]["question_id"]
+                print(f"[DEBUG] Created question with ID: {question_id}")
+                
+                # b) Insert Options
+                options_insert_result = supabase.table("options").insert({
+                    "question_id": question_id,
+                    "option_a": question_data["option_a"],
+                    "option_b": question_data["option_b"],
+                    "option_c": question_data["option_c"],
+                    "option_d": question_data["option_d"],
+                    "correct_option": question_data["correct_option"]
+                }).execute()
+                
+                if not options_insert_result.data:
+                    raise Exception(f"Failed to insert options for question {question_id}")
+                
+                # c) Link Question to Quiz
+                max_marks = question_data.get("marks", 1)
+                quiz_questions_insert_result = supabase.table("quiz_questions").insert({
+                    "quiz_id": quiz_id,
+                    "question_id": question_id,
+                    "question_order": question_order,
+                    "max_marks": max_marks
+                }).execute()
+                
+                if not quiz_questions_insert_result.data:
+                    raise Exception(f"Failed to link question {question_id} to quiz {quiz_id}")
+                
+                question_order += 1
+            
+            # STEP 7 - COMMIT TRANSACTION (Supabase auto-commits individual operations)
+            print(f"[DEBUG] Successfully saved all {len(questions_data)} questions to database")
+            
+            # STEP 8 - RETURN RESPONSE
+            return {
+                "success": True,
+                "message": "Quiz generated successfully",
+                "quiz_id": quiz_id,
+                "topic": topic,
+                "total_questions": len(questions_data)
+            }
+            
+        except Exception as e:
+            # STEP 7 - ROLLBACK TRANSACTION (cleanup on failure)
+            print(f"[DEBUG] Database operation failed: {str(e)}")
+            
+            # Clean up quiz record if it was created
+            if quiz_id:
+                try:
+                    # Delete quiz_questions first (foreign key constraint)
+                    supabase.table("quiz_questions").delete().eq("quiz_id", quiz_id).execute()
+                    # Delete quiz
+                    supabase.table("quizzes").delete().eq("quiz_id", quiz_id).execute()
+                    print(f"[DEBUG] Cleaned up quiz {quiz_id} due to failure")
+                except Exception as cleanup_error:
+                    print(f"[DEBUG] Cleanup failed: {str(cleanup_error)}")
+            
+            raise HTTPException(status_code=500, detail=f"Database save failed: {str(e)}")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[DEBUG] Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Quiz generation failed: {str(e)}")
+
 @app.get("/quiz/{quiz_id}")
 async def get_quiz(quiz_id: int):
     """Get quiz questions and options (without correct answers for taking quiz)"""
@@ -1144,34 +1331,75 @@ async def submit_quiz(request: QuizSubmissionRequest, current_user: str = Depend
 
         if not save_result["success"]:
             print(f"[DEBUG] Save failed: {save_result['error']}")
-            raise HTTPException(status_code=500, detail=save_result["error"])        # Return results with correct answers for analytics
+            raise HTTPException(status_code=500, detail=save_result["error"])
+        
+        # Calculate percentage from save result
+        percentage = save_result["percentage"]
+        
+        # Build comprehensive quiz report with detailed results
         detailed_results = []
+        correct_count = 0
+        
         for q in quiz_data["questions"]:
             user_answer = next((a for a in request.answers if a["question_id"] == q["question_id"]), None)
             user_selected = user_answer["selected_option"] if user_answer else None
+            is_correct = user_selected == q["correct_option"] if user_selected else False
+            marks_awarded = 1 if is_correct else 0
             
-            detailed_results.append({
+            if is_correct:
+                correct_count += 1
+            
+            # Create detailed question result
+            question_result = {
                 "question_id": q["question_id"],
                 "question_text": q["question_text"],
-                "option_a": q["option_a"],
-                "option_b": q["option_b"],
-                "option_c": q["option_c"],
-                "option_d": q["option_d"],
+                "options": {
+                    "A": q["option_a"],
+                    "B": q["option_b"], 
+                    "C": q["option_c"],
+                    "D": q["option_d"]
+                },
                 "correct_option": q["correct_option"],
+                "correct_answer": q[f"option_{q['correct_option'].lower()}"],
                 "user_selected": user_selected,
-                "is_correct": user_selected == q["correct_option"] if user_selected else False
-            })
+                "user_answer": q[f"option_{user_selected.lower()}"] if user_selected else "Not answered",
+                "is_correct": is_correct,
+                "marks_awarded": marks_awarded,
+                "max_marks": 1,
+                "status": "✅ Correct" if is_correct else "❌ Incorrect" if user_selected else "⚠️ Not answered"
+            }
+            
+            detailed_results.append(question_result)
+        
+        # Generate performance summary
+        performance_grade = "Excellent" if percentage >= 80 else "Good" if percentage >= 60 else "Needs Improvement"
         
         return {
             "success": True,
-            "user_quiz_id": save_result["user_quiz_id"],
-            "score": score,
-            "total_marks": total_marks,
-            "percentage": save_result["percentage"],
-            "feedback": feedback,
-            "quiz_topic": quiz_data["topic"],
-            "detailed_results": detailed_results,
-            "message": "Quiz submitted successfully"
+            "message": "Quiz submitted successfully",
+            "quiz_report": {
+                "quiz_id": request.quiz_id,
+                "user_quiz_id": save_result["user_quiz_id"],
+                "topic": quiz_data["topic"],
+                "submission_summary": {
+                    "total_questions": total_marks,
+                    "correct_answers": correct_count,
+                    "incorrect_answers": total_marks - correct_count,
+                    "score": score,
+                    "total_marks": total_marks,
+                    "percentage": percentage,
+                    "grade": performance_grade,
+                    "status": "Passed" if percentage >= 60 else "Failed"
+                },
+                "performance_feedback": feedback,
+                "detailed_results": detailed_results,
+                "statistics": {
+                    "accuracy": f"{percentage:.1f}%",
+                    "questions_attempted": len([a for a in request.answers if a["selected_option"]]),
+                    "questions_skipped": total_marks - len([a for a in request.answers if a["selected_option"]]),
+                    "time_per_question": "N/A"  # Can be calculated if timing is tracked
+                }
+            }
         }
         
     except HTTPException:

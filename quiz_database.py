@@ -60,6 +60,11 @@ def save_quiz_to_database(topic: str, questions_data: List[Dict], performance_re
     """
     Save a complete quiz to the database using stored procedure for better performance
     """
+    # TEMPORARY: Skip stored procedure, use Supabase client directly
+    if supabase:
+        print("Using Supabase client fallback for save_quiz_to_database (stored procedure disabled)")
+        return save_quiz_to_database_supabase(topic, questions_data, performance_report, user_id)
+    
     conn = get_db_connection()
     if not conn:
         # Fallback to Supabase client
@@ -79,10 +84,10 @@ def save_quiz_to_database(topic: str, questions_data: List[Dict], performance_re
         # Convert questions data to JSONB format
         questions_json = json.dumps(questions_data)
         
-        # Call stored procedure for creating complete quiz
+        # Call stored procedure for creating complete quiz (updated for 3-column schema)
         cursor.execute("""
-            SELECT create_complete_quiz(%s, %s, %s, %s::jsonb) as result;
-        """, (user_id, topic[:255], performance_report, questions_json))
+            SELECT create_complete_quiz(%s, %s, %s::jsonb) as result;
+        """, (user_id, topic[:255], questions_json))
         
         result = cursor.fetchone()['result']
         
@@ -91,11 +96,25 @@ def save_quiz_to_database(topic: str, questions_data: List[Dict], performance_re
         
     except Exception as e:
         print(f"Error calling stored procedure: {str(e)}")
-        # Fallback to original manual method if stored procedure fails
-        return save_quiz_to_database_manual(topic, questions_data, performance_report, user_id, conn)
-    finally:
+        # IMPORTANT: Rollback failed transaction before fallback
+        try:
+            cursor.execute("ROLLBACK;")
+        except:
+            pass
+        # Close the failed connection - fallback will create fresh connection
         cursor.close()
         conn.close()
+        # Fallback to original manual method with fresh connection (conn=None)
+        return save_quiz_to_database_manual(topic, questions_data, performance_report, user_id, conn=None)
+    finally:
+        try:
+            cursor.close()
+        except:
+            pass
+        try:
+            conn.close()
+        except:
+            pass
 
 def save_quiz_to_database_manual(topic: str, questions_data: List[Dict], performance_report: str = None, user_id: str = None, conn=None) -> Dict[str, Any]:
     """
@@ -111,20 +130,24 @@ def save_quiz_to_database_manual(topic: str, questions_data: List[Dict], perform
     try:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        # Begin transaction
-        cursor.execute("BEGIN;")
-        
         # Use demo user if no user_id provided
         if not user_id:
             user_id = "550e8400-e29b-41d4-a716-446655440000"
         
-        # 1. Create quiz record
+        # Begin transaction (ensure clean state)
+        try:
+            cursor.execute("ROLLBACK;")  # Clear any previous failed transaction
+        except:
+            pass
+        cursor.execute("BEGIN;")
+        
+        # 1. Create quiz record (schema: quiz_id, user_id, topic only)
         quiz_insert_sql = """
-            INSERT INTO quizzes (user_id, topic, performance_report, total_questions) 
-            VALUES (%s, %s, %s, %s) 
+            INSERT INTO quizzes (user_id, topic) 
+            VALUES (%s, %s) 
             RETURNING quiz_id;
         """
-        cursor.execute(quiz_insert_sql, (user_id, topic[:255], performance_report, len(questions_data)))
+        cursor.execute(quiz_insert_sql, (user_id, topic[:255]))
         quiz_result = cursor.fetchone()
         quiz_id = quiz_result['quiz_id']
         
@@ -191,12 +214,11 @@ def save_quiz_to_database_supabase(topic: str, questions_data: List[Dict], perfo
         print(f"[DEBUG] Attempting to save quiz for user_id: {user_id}")
         
         # Create quiz record directly (service key should bypass RLS)
+        # Schema: quizzes table only has quiz_id, user_id, topic
         print(f"[DEBUG] Creating quiz with topic: {topic[:50]}...")
         quiz_result = supabase.table("quizzes").insert({
             "user_id": user_id,
-            "topic": topic[:255],
-            "performance_report": performance_report,
-            "total_questions": len(questions_data)
+            "topic": topic[:255]
         }).execute()
         
         if not quiz_result.data:
@@ -207,7 +229,10 @@ def save_quiz_to_database_supabase(topic: str, questions_data: List[Dict], perfo
         
         # Save each question and its options
         for order, question_data in enumerate(questions_data, 1):
+            print(f"[DEBUG] Processing question {order}/{len(questions_data)}")
+            
             # Insert question
+            print(f"[DEBUG] Inserting question: {question_data['question_text'][:50]}...")
             question_result = supabase.table("questions").insert({
                 "question_text": question_data["question_text"]
             }).execute()
@@ -216,8 +241,10 @@ def save_quiz_to_database_supabase(topic: str, questions_data: List[Dict], perfo
                 return {"success": False, "error": f"Failed to save question {order}"}
             
             question_id = question_result.data[0]["question_id"]
+            print(f"[DEBUG] Question saved with ID: {question_id}")
             
             # Insert options for this question
+            print(f"[DEBUG] Inserting options for question {question_id}")
             options_result = supabase.table("options").insert({
                 "question_id": question_id,
                 "option_a": question_data["option_a"],
@@ -230,7 +257,10 @@ def save_quiz_to_database_supabase(topic: str, questions_data: List[Dict], perfo
             if not options_result.data:
                 return {"success": False, "error": f"Failed to save options for question {order}"}
             
+            print(f"[DEBUG] Options saved for question {question_id}")
+            
             # Link question to quiz
+            print(f"[DEBUG] Linking question {question_id} to quiz {quiz_id}")
             quiz_question_result = supabase.table("quiz_questions").insert({
                 "quiz_id": quiz_id,
                 "question_id": question_id,
@@ -240,6 +270,8 @@ def save_quiz_to_database_supabase(topic: str, questions_data: List[Dict], perfo
             
             if not quiz_question_result.data:
                 return {"success": False, "error": f"Failed to link question {order} to quiz"}
+            
+            print(f"[DEBUG] Question {order} fully processed")
         
         return {
             "success": True,
@@ -278,9 +310,9 @@ def get_quiz_by_id(quiz_id: int) -> Optional[Dict[str, Any]]:
         
         print(f"[DEBUG] Fetching quiz with ID: {quiz_id}")
         
-        # Get quiz basic info
+        # Get quiz basic info (schema: quiz_id, user_id, topic only)
         quiz_select_sql = """
-            SELECT quiz_id, user_id, topic, performance_report, total_questions, created_at 
+            SELECT quiz_id, user_id, topic
             FROM quizzes 
             WHERE quiz_id = %s;
         """
@@ -336,7 +368,6 @@ def get_quiz_by_id(quiz_id: int) -> Optional[Dict[str, Any]]:
         return {
             "quiz_id": quiz_result['quiz_id'],
             "topic": quiz_result['topic'],
-            "performance_report": quiz_result['performance_report'],
             "questions": questions,
             "total_questions": len(questions)
         }
@@ -355,8 +386,8 @@ def get_quiz_by_id_supabase(quiz_id: int) -> Optional[Dict[str, Any]]:
     try:
         print(f"[DEBUG] Fetching quiz with ID: {quiz_id} using Supabase")
         
-        # Get quiz basic info
-        quiz_result = supabase.table("quizzes").select("quiz_id, topic, performance_report").eq("quiz_id", quiz_id).execute()
+        # Get quiz basic info (schema: quiz_id, user_id, topic only)
+        quiz_result = supabase.table("quizzes").select("quiz_id, topic").eq("quiz_id", quiz_id).execute()
         
         if not quiz_result.data:
             print(f"No quiz found with ID: {quiz_id}")
@@ -412,7 +443,6 @@ def get_quiz_by_id_supabase(quiz_id: int) -> Optional[Dict[str, Any]]:
         return {
             "quiz_id": quiz_info['quiz_id'],
             "topic": quiz_info['topic'],
-            "performance_report": quiz_info['performance_report'],
             "questions": questions,
             "total_questions": len(questions)
         }
@@ -424,44 +454,14 @@ def get_quiz_by_id_supabase(quiz_id: int) -> Optional[Dict[str, Any]]:
 def save_user_quiz_attempt(user_id: str, quiz_id: int, user_answers: List[Dict], 
                           total_marks: int, score: int) -> Dict[str, Any]:
     """
-    Save user's quiz attempt and answers using stored procedure for better performance
+    Save user's quiz attempt and answers using Supabase client
     """
-    conn = get_db_connection()
-    if not conn:
-        # Fallback to Supabase client
-        if supabase:
-            print("Using Supabase client fallback for save_user_quiz_attempt")
-            return save_user_quiz_attempt_supabase(user_id, quiz_id, user_answers, total_marks, score)
-        else:
-            return {"success": False, "error": "Database connection failed"}
-    
-    try:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Use demo user if no user_id provided
-        if not user_id:
-            user_id = "550e8400-e29b-41d4-a716-446655440000"
-        
-        # Convert answers to JSONB format
-        answers_json = json.dumps(user_answers)
-        
-        # Call stored procedure for saving quiz attempt
-        cursor.execute("""
-            SELECT save_quiz_attempt(%s, %s, %s::jsonb, %s, %s) as result;
-        """, (user_id, quiz_id, answers_json, total_marks, score))
-        
-        result = cursor.fetchone()['result']
-        
-        # Return the result from stored procedure
-        return result
-        
-    except Exception as e:
-        print(f"Error calling stored procedure for quiz attempt: {str(e)}")
-        # Fallback to original manual method if stored procedure fails
-        return save_user_quiz_attempt_manual(user_id, quiz_id, user_answers, total_marks, score, conn)
-    finally:
-        cursor.close()
-        conn.close()
+    # Use Supabase client directly since we're using Supabase
+    if supabase:
+        return save_user_quiz_attempt_supabase(user_id, quiz_id, user_answers, total_marks, score)
+    else:
+        # Fallback to manual method if Supabase is not available
+        return save_user_quiz_attempt_manual(user_id, quiz_id, user_answers, total_marks, score)
 
 def save_user_quiz_attempt_manual(user_id: str, quiz_id: int, user_answers: List[Dict], 
                                  total_marks: int, score: int, conn=None) -> Dict[str, Any]:
@@ -497,16 +497,16 @@ def save_user_quiz_attempt_manual(user_id: str, quiz_id: int, user_answers: List
         existing = cursor.fetchone()
         
         if existing:
-            # Update existing attempt
+            # Update existing attempt (schema: user_quiz_id, user_id, quiz_id, score, total_marks)
             user_quiz_id = existing['user_quiz_id']
             
             update_attempt_sql = """
                 UPDATE user_quizzes 
-                SET total_marks = %s, score = %s, percentage = %s, completed_at = NOW()
+                SET total_marks = %s, score = %s
                 WHERE user_quiz_id = %s;
             """
             cursor.execute(update_attempt_sql, (
-                total_marks, score, round(percentage, 2), user_quiz_id
+                total_marks, score, user_quiz_id
             ))
             
             # Delete old answers
@@ -514,14 +514,14 @@ def save_user_quiz_attempt_manual(user_id: str, quiz_id: int, user_answers: List
             cursor.execute(delete_answers_sql, (user_quiz_id,))
             
         else:
-            # Create new attempt
+            # Create new attempt (schema: user_quiz_id, user_id, quiz_id, score, total_marks)
             insert_attempt_sql = """
-                INSERT INTO user_quizzes (user_id, quiz_id, total_marks, score, percentage)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO user_quizzes (user_id, quiz_id, total_marks, score)
+                VALUES (%s, %s, %s, %s)
                 RETURNING user_quiz_id;
             """
             cursor.execute(insert_attempt_sql, (
-                user_id, quiz_id, total_marks, score, round(percentage, 2)
+                user_id, quiz_id, total_marks, score
             ))
             result = cursor.fetchone()
             user_quiz_id = result['user_quiz_id']
@@ -542,10 +542,13 @@ def save_user_quiz_attempt_manual(user_id: str, quiz_id: int, user_answers: List
         # Commit transaction
         cursor.execute("COMMIT;")
         
+        # Calculate percentage for response (not stored in DB)
+        percentage = (score / total_marks) * 100 if total_marks > 0 else 0
+        
         return {
             "success": True,
             "user_quiz_id": user_quiz_id,
-            "percentage": percentage,
+            "percentage": round(percentage, 2),
             "message": "Quiz attempt saved successfully"
         }
         
@@ -574,13 +577,12 @@ def save_user_quiz_attempt_supabase(user_id: str, quiz_id: int, user_answers: Li
         existing_attempt = supabase.table("user_quizzes").select("user_quiz_id").eq("user_id", user_id).eq("quiz_id", quiz_id).execute()
         
         if existing_attempt.data:
-            # Update existing attempt
+            # Update existing attempt (schema: user_quiz_id, user_id, quiz_id, score, total_marks)
             user_quiz_id = existing_attempt.data[0]["user_quiz_id"]
             
             update_result = supabase.table("user_quizzes").update({
                 "total_marks": total_marks,
-                "score": score,
-                "percentage": round(percentage, 2)
+                "score": score
             }).eq("user_quiz_id", user_quiz_id).execute()
             
             if not update_result.data:
@@ -590,13 +592,12 @@ def save_user_quiz_attempt_supabase(user_id: str, quiz_id: int, user_answers: Li
             supabase.table("user_answers").delete().eq("user_quiz_id", user_quiz_id).execute()
             
         else:
-            # Create new attempt
+            # Create new attempt (schema: user_quiz_id, user_id, quiz_id, score, total_marks)
             insert_result = supabase.table("user_quizzes").insert({
                 "user_id": user_id,
                 "quiz_id": quiz_id,
                 "total_marks": total_marks,
-                "score": score,
-                "percentage": round(percentage, 2)
+                "score": score
             }).execute()
             
             if not insert_result.data:
@@ -616,10 +617,13 @@ def save_user_quiz_attempt_supabase(user_id: str, quiz_id: int, user_answers: Li
             if not answer_result.data:
                 return {"success": False, "error": f"Failed to save answer for question {answer_data['question_id']}"}
         
+        # Calculate percentage for response (not stored in DB)
+        percentage = (score / total_marks) * 100 if total_marks > 0 else 0
+        
         return {
             "success": True,
             "user_quiz_id": user_quiz_id,
-            "percentage": percentage,
+            "percentage": round(percentage, 2),
             "message": "Quiz attempt saved successfully using Supabase fallback"
         }
         
@@ -645,17 +649,14 @@ def get_user_quiz_attempts(user_id: str, limit: int = 50) -> Dict[str, Any]:
         attempts_select_sql = """
             SELECT 
                 uq.user_quiz_id,
-                uq.completed_at,
                 uq.total_marks,
                 uq.score,
-                uq.percentage,
                 q.quiz_id,
-                q.topic,
-                q.performance_report
+                q.topic
             FROM user_quizzes uq
             JOIN quizzes q ON uq.quiz_id = q.quiz_id
             WHERE uq.user_id = %s
-            ORDER BY uq.completed_at DESC
+            ORDER BY uq.user_quiz_id DESC
             LIMIT %s;
         """
         cursor.execute(attempts_select_sql, (user_id, limit))
@@ -663,15 +664,18 @@ def get_user_quiz_attempts(user_id: str, limit: int = 50) -> Dict[str, Any]:
         
         attempts = []
         for attempt in attempts_data:
+            # Calculate percentage from score and total_marks
+            percentage = (attempt['score'] / attempt['total_marks']) * 100 if attempt['total_marks'] > 0 else 0
+            
             attempts.append({
                 "user_quiz_id": attempt['user_quiz_id'],
                 "quiz_id": attempt['quiz_id'],
                 "topic": attempt['topic'],
-                "completed_at": attempt['completed_at'],
+                "completed_at": None,  # Not stored in current schema
                 "total_marks": attempt['total_marks'],
                 "score": attempt['score'],
-                "percentage": float(attempt['percentage']) if attempt['percentage'] else 0.0,
-                "performance_report": attempt['performance_report']
+                "percentage": round(percentage, 2),
+                "performance_report": None  # Not stored in current schema
             })
         
         return {
@@ -699,12 +703,10 @@ def get_user_quiz_attempts_supabase(user_id: str, limit: int = 50) -> Dict[str, 
         # Get user quiz attempts first
         attempts_result = supabase.table("user_quizzes").select("""
             user_quiz_id,
-            completed_at,
             total_marks,
             score,
-            percentage,
             quiz_id
-        """).eq("user_id", user_id).order("completed_at", desc=True).limit(limit).execute()
+        """).eq("user_id", user_id).order("user_quiz_id", desc=True).limit(limit).execute()
         
         if not attempts_result.data:
             return {
@@ -717,20 +719,23 @@ def get_user_quiz_attempts_supabase(user_id: str, limit: int = 50) -> Dict[str, 
         for attempt in attempts_result.data:
             # Get quiz information for each attempt
             quiz_result = supabase.table("quizzes").select(
-                "topic, performance_report"
+                "topic"
             ).eq("quiz_id", attempt['quiz_id']).execute()
             
             if quiz_result.data:
                 quiz_info = quiz_result.data[0]
+                # Calculate percentage from score and total_marks
+                percentage = (attempt['score'] / attempt['total_marks']) * 100 if attempt['total_marks'] > 0 else 0
+                
                 attempts.append({
                     "user_quiz_id": attempt['user_quiz_id'],
                     "quiz_id": attempt['quiz_id'],
                     "topic": quiz_info['topic'],
-                    "completed_at": attempt['completed_at'],
+                    "completed_at": None,  # Not stored in current schema
                     "total_marks": attempt['total_marks'],
                     "score": attempt['score'],
-                    "percentage": float(attempt['percentage']) if attempt['percentage'] else 0.0,
-                    "performance_report": quiz_info['performance_report']
+                    "percentage": round(percentage, 2),
+                    "performance_report": None  # Not stored in current schema
                 })
         
         return {
@@ -768,13 +773,10 @@ def get_quiz_attempt_details(user_quiz_id: int) -> Optional[Dict[str, Any]]:
         attempt_info_sql = """
             SELECT 
                 uq.user_quiz_id,
-                uq.taken_date,
                 uq.total_marks,
                 uq.score,
-                uq.percentage,
                 q.quiz_id,
-                q.topic,
-                q.performance_report
+                q.topic
             FROM user_quizzes uq
             JOIN quizzes q ON uq.quiz_id = q.quiz_id
             WHERE uq.user_quiz_id = %s;
@@ -823,15 +825,18 @@ def get_quiz_attempt_details(user_quiz_id: int) -> Optional[Dict[str, Any]]:
                 "is_correct": detail['selected_option'] == detail['correct_option']
             })
         
+        # Calculate percentage from score and total_marks
+        percentage = (attempt_info['score'] / attempt_info['total_marks']) * 100 if attempt_info['total_marks'] > 0 else 0
+        
         return {
             "user_quiz_id": user_quiz_id,
             "quiz_id": quiz_id,
             "topic": attempt_info['topic'],
-            "taken_date": attempt_info['taken_date'],
+            "taken_date": None,  # Not stored in current schema
             "total_marks": attempt_info['total_marks'],
             "score": attempt_info['score'],
-            "percentage": float(attempt_info['percentage']) if attempt_info['percentage'] else 0.0,
-            "performance_report": attempt_info['performance_report'],
+            "percentage": round(percentage, 2),
+            "performance_report": None,  # Not stored in current schema
             "detailed_answers": detailed_answers
         }
         

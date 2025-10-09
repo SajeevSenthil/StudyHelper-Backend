@@ -3,18 +3,70 @@ import re
 import json
 import base64
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 from psycopg2 import sql
 from dotenv import load_dotenv
 from datetime import datetime
-from typing import Dict, Any
-import openai
+from typing import Dict, Any, Optional
+import google.generativeai as genai
 
 # Load environment variables
 load_dotenv()
 
-# Configure OpenAI API
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Configure Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "models/gemini-2.5-flash")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("[WARNING] GEMINI_API_KEY is not set. Summarization features will be unavailable.")
+
+
+def _call_gemini(
+    prompt: str,
+    *,
+    system_instruction: Optional[str] = None,
+    temperature: float = 0.3,
+    max_output_tokens: int = 1024,
+) -> str:
+    """Send a prompt to Gemini and return cleaned text or an error message."""
+
+    if not GEMINI_API_KEY:
+        return "Gemini API Error: API key is not configured."
+
+    try:
+        # Combine system instruction with prompt for older API versions
+        full_prompt = prompt
+        if system_instruction:
+            full_prompt = f"{system_instruction}\n\n{prompt}"
+        
+        model = genai.GenerativeModel(model_name=GEMINI_MODEL_NAME)
+        response = model.generate_content(
+            full_prompt,
+            generation_config={
+                "temperature": temperature,
+                "max_output_tokens": max_output_tokens,
+            },
+        )
+
+        text = getattr(response, "text", None)
+        if text:
+            return clean_text_response(text)
+
+        candidates = getattr(response, "candidates", None)
+        if candidates:
+            for candidate in candidates:
+                content = getattr(candidate, "content", None)
+                parts = getattr(content, "parts", []) if content else []
+                combined = " ".join(part.text for part in parts if getattr(part, "text", None))
+                if combined:
+                    return clean_text_response(combined)
+
+        return "Gemini API Error: Empty response received."
+
+    except Exception as exc:  # noqa: BLE001
+        return f"Gemini API Error: {exc}"
 
 def get_db_connection():
     """
@@ -73,10 +125,10 @@ def save_document_session_sql(user_id: str, topic: str, original_content: str,
         if not user_id:
             user_id = "550e8400-e29b-41d4-a716-446655440000"
         
-        # SQL INSERT query using new schema
+        # SQL INSERT query - match Supabase schema (no keywords column)
         insert_query = """
-        INSERT INTO documents (user_id, topic, content, summary, keywords)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO documents (user_id, topic, content, summary)
+        VALUES (%s, %s, %s, %s)
         RETURNING doc_id;
         """
         
@@ -85,8 +137,7 @@ def save_document_session_sql(user_id: str, topic: str, original_content: str,
             user_id,
             topic[:255],  # Ensure topic fits in VARCHAR(255)
             original_content,
-            summary,
-            keywords
+            summary
         ))
         
         # Get the inserted document ID
@@ -297,139 +348,84 @@ def clean_text_response(text: str) -> str:
     return text
 
 def summarize_text(text: str, max_length: int = 200) -> str:
-    """
-    Summarize the given text using OpenAI API
-    
-    Args:
-        text (str): The text to summarize
-        max_length (int): Maximum length of summary in words (approximate)
-    
-    Returns:
-        str: Summarized text
-    """
-    try:
-        if not text or len(text.strip()) < 50:
-            return "Text too short to summarize effectively."
-        
-        # Use OpenAI for summarization
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant that creates concise, informative summaries. Focus on the main ideas, key concepts, and important details."
-                },
-                {
-                    "role": "user",
-                    "content": f"Please provide a concise summary of the following text in approximately {max_length} words or less:\n\n{text}"
-                }
-            ],
-            max_tokens=1500,
-            temperature=0.3
-        )
-        
-        if response and response.choices:
-            summary = response.choices[0].message.content.strip()
-            # Clean the summary response
-            summary = clean_text_response(summary)
-            return summary
-        else:
-            return "OpenAI API Error: No response received"
-        
-    except Exception as e:
-        return f"OpenAI API Error: {str(e)}"
+    """Summarize the given text using Gemini 2.5 Flash."""
+
+    if not text or len(text.strip()) < 50:
+        return "Text too short to summarize effectively."
+
+    prompt = (
+        "Summarize the following content in plain language. "
+        f"Limit the response to roughly {max_length} words, focusing on the main ideas, "
+        "critical details, and important context.\n\n"
+        f"Content:\n{text}"
+    )
+
+    return _call_gemini(
+        prompt,
+        system_instruction=(
+            "You are a helpful study assistant that produces concise, structured summaries "
+            "for students. Capture the core ideas, important definitions, and any critical "
+            "implications in an easy-to-scan format."
+        ),
+        temperature=0.2,
+        max_output_tokens=2048,
+    )
 
 def extract_keywords(text: str) -> str:
-    """
-    Extract key terms and concepts from the text using OpenAI API
-    
-    Args:
-        text (str): The text to analyze
-    
-    Returns:
-        str: Key terms and concepts
-    """
-    try:
-        if not text or len(text.strip()) < 20:
-            return "Text too short for keyword extraction."
-        
-        # Use OpenAI for keyword extraction
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant that extracts key terms and concepts from text. Present them as a comma-separated list focusing on technical terms, main concepts, and subject-specific vocabulary."
-                },
-                {
-                    "role": "user",
-                    "content": f"Please extract the key terms, concepts, and important topics from the following text:\n\n{text}"
-                }
-            ],
-            max_tokens=200,
-            temperature=0.3
-        )
-        
-        if response and response.choices:
-            keywords = response.choices[0].message.content.strip()
-            # Clean the keywords response
-            keywords = clean_text_response(keywords)
-            return keywords
-        else:
-            return "OpenAI API Error: No response received"
-        
-    except Exception as e:
-        return f"OpenAI API Error: {str(e)}"
+    """Extract key terms and concepts from the text using Gemini 2.5 Flash."""
+
+    if not text or len(text.strip()) < 20:
+        return "Text too short for keyword extraction."
+
+    prompt = (
+        "List the most important keywords, concepts, and domain-specific terms found in the "
+        "following passage. Provide them as a comma-separated list with no additional prose.\n\n"
+        f"Content:\n{text}"
+    )
+
+    return _call_gemini(
+        prompt,
+        system_instruction=(
+            "You analyze study material and surface the top concepts and keywords students "
+            "should review. Keep the response as a simple comma-separated list."
+        ),
+        temperature=0.2,
+        max_output_tokens=256,
+    )
 
 def generate_topic_title(text: str) -> str:
-    """
-    Generate a concise topic title from the text using OpenAI API
-    
-    Args:
-        text (str): The text to analyze
-    
-    Returns:
-        str: Generated topic title
-    """
-    try:
-        if not text or len(text.strip()) < 20:
-            return "Short Text Document"
-        
-        # Use OpenAI for title generation
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant that generates concise, descriptive titles for documents. The title should be 3-8 words and capture the main topic or theme."
-                },
-                {
-                    "role": "user",
-                    "content": f"Please generate a concise title for the following text content:\n\n{text[:500]}..."
-                }
-            ],
-            max_tokens=50,
-            temperature=0.3
-        )
-        
-        if response and response.choices:
-            title = response.choices[0].message.content.strip()
-            # Clean and limit the title
-            title = clean_text_response(title)
-            # Remove quotes if present
-            title = title.strip('"\'')
-            if len(title) > 60:
-                title = title[:57] + "..."
-            return title
-        else:
-            return "Document Summary"
-        
-    except Exception as e:
-        return f"Document Summary - {str(e)[:20]}"
+    """Generate a concise topic title from the text using Gemini 2.5 Flash."""
+
+    if not text or len(text.strip()) < 20:
+        return "Short Text Document"
+
+    prompt = (
+        "Create a concise, descriptive title (3-8 words) for the following learning material. "
+        "Avoid quoting or adding extra commentary.\n\n"
+        f"Content sample:\n{text[:600]}"
+    )
+
+    title = _call_gemini(
+        prompt,
+        system_instruction=(
+            "You craft short, descriptive titles for study documents. Keep them punchy, "
+            "clear, and free of surrounding quotation marks."
+        ),
+        temperature=0.3,
+        max_output_tokens=128,
+    )
+
+    if title.startswith("Gemini API Error"):
+        return "Document Summary"
+
+    title = title.strip('"\'')
+    if len(title) > 60:
+        title = title[:57] + "..."
+    return title
 
 def summarize_and_save(text: str, topic: str = None, user_id: str = None, max_length: int = 200) -> Dict[str, Any]:
     """
-    Summarize text using OpenAI and automatically save it to PostgreSQL using direct SQL
+    Summarize text using Gemini 2.5 Flash and automatically save it via direct SQL helpers
     
     Args:
         text (str): The text to summarize
@@ -452,7 +448,7 @@ def summarize_and_save(text: str, topic: str = None, user_id: str = None, max_le
                 "doc_id": None
             }
         
-        # Generate summary and keywords using OpenAI
+    # Generate summary and keywords using Gemini
         summary = summarize_text(text, max_length)
         keywords = extract_keywords(text)
         

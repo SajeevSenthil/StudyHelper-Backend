@@ -29,124 +29,169 @@ def generate_quiz_questions(content: str, topic: str = None, num_questions: int 
     """
     try:
         if topic and not content:
-            # Generate quiz from topic
-            prompt = f"""
-            Generate exactly {num_questions} multiple choice questions about "{topic}".
-            
-            Requirements:
-            - Each question should have exactly 4 options (A, B, C, D)
-            - Only one correct answer per question
-            - Questions should be challenging but fair
-            - Cover different aspects of the topic
-            - Include a brief explanation for the correct answer
-            
-            Format your response as valid JSON:
-            {{
-                "topic": "{topic}",
-                "questions": [
-                    {{
-                        "question_text": "Question here?",
-                        "option_a": "First option",
-                        "option_b": "Second option", 
-                        "option_c": "Third option",
-                        "option_d": "Fourth option",
-                        "correct_option": "A",
-                        "explanation": "Brief explanation why this is correct"
-                    }}
-                ]
-            }}
-            
-            Make sure to return exactly {num_questions} questions.
-            """
+            # Generate quiz from topic only
+            prompt = f"""You are an expert educational content creator specializing in generating high-quality multiple-choice questions for student assessments.
+
+Generate {num_questions} multiple-choice questions based on the following topic:
+
+TOPIC: {topic}
+
+REQUIREMENTS:
+1. Each question must have exactly 4 options (A, B, C, D)
+2. Only ONE option should be correct
+3. The other 3 options should be plausible distractors (not obviously wrong)
+4. Questions should test understanding, not just memorization
+5. Vary difficulty across easy, medium, and hard levels
+6. Cover different aspects of the topic
+7. Make questions clear and unambiguous
+8. Each question is worth 1 mark
+
+IMPORTANT: Return the output ONLY as a valid JSON array with this exact structure:
+[
+  {{
+    "question_text": "What is the primary concept in {topic}?",
+    "option_a": "First option",
+    "option_b": "Second option",
+    "option_c": "Third option", 
+    "option_d": "Fourth option",
+    "correct_option": "A"
+  }}
+]
+
+Do not include any additional text, explanations, or markdown formatting. Output must be valid JSON only."""
         else:
             # Generate quiz from content
-            prompt = f"""
-            Based on the following content, generate exactly {num_questions} multiple choice questions.
+            topic_name = topic or "Content-based Quiz"
+            content_snippet = content[:2500] if content else "No content provided"
             
-            Content:
-            {content[:3000]}  # Limit content to avoid token limits
-            
-            Requirements:
-            - Each question should have exactly 4 options (A, B, C, D)
-            - Only one correct answer per question
-            - Questions should test understanding of the content
-            - Cover different parts of the material
-            - Include a brief explanation for the correct answer
-            
-            Format your response as valid JSON:
-            {{
-                "topic": "Brief topic name based on content",
-                "questions": [
-                    {{
-                        "question_text": "Question here?",
-                        "option_a": "First option",
-                        "option_b": "Second option", 
-                        "option_c": "Third option",
-                        "option_d": "Fourth option",
-                        "correct_option": "A",
-                        "explanation": "Brief explanation why this is correct"
-                    }}
-                ]
-            }}
-            
-            Make sure to return exactly {num_questions} questions.
-            """
+            prompt = f"""You are an expert educational content creator specializing in generating high-quality multiple-choice questions for student assessments.
+
+Generate {num_questions} multiple-choice questions based on the following study material:
+
+TOPIC: {topic_name}
+
+STUDY MATERIAL:
+{content_snippet}
+
+REQUIREMENTS:
+1. Each question must have exactly 4 options (A, B, C, D)
+2. Only ONE option should be correct
+3. The other 3 options should be plausible distractors (not obviously wrong)
+4. Questions should test understanding, not just memorization
+5. Vary difficulty across easy, medium, and hard levels
+6. Cover different aspects of the material
+7. Make questions clear and unambiguous
+8. Each question is worth 1 mark
+
+IMPORTANT: Return the output ONLY as a valid JSON array with this exact structure:
+[
+  {{
+    "question_text": "Based on the material, what is...?",
+    "option_a": "First option",
+    "option_b": "Second option",
+    "option_c": "Third option",
+    "option_d": "Fourth option", 
+    "correct_option": "A"
+  }}
+]
+
+Do not include any additional text, explanations, or markdown formatting. Output must be valid JSON only."""
         
+        # Make API call with explicit instructions
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are an expert quiz generator. Always return valid JSON format with exactly the requested number of questions. Ensure questions are educational and test real understanding."
+                    "content": "You are a quiz generator. You MUST return only a valid JSON array with exactly the requested number of questions. Each question must have all 5 required fields: question_text, option_a, option_b, option_c, option_d, correct_option. No additional text outside JSON."
                 },
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=3000,
-            temperature=0.7
+            max_tokens=4000,
+            temperature=0.3  # Lower temperature for more consistent output
         )
         
-        # Clean the response
-        quiz_text = clean_quiz_response(response.choices[0].message.content)
+        # Get and clean the response
+        quiz_text = response.choices[0].message.content.strip()
+        
+        # Remove any markdown code blocks if present
+        if quiz_text.startswith("```json"):
+            quiz_text = quiz_text[7:]
+        if quiz_text.startswith("```"):
+            quiz_text = quiz_text[3:]
+        if quiz_text.endswith("```"):
+            quiz_text = quiz_text[:-3]
+        quiz_text = quiz_text.strip()
         
         # Parse JSON response
         try:
             quiz_data = json.loads(quiz_text)
-        except json.JSONDecodeError:
-            # Try to extract JSON from response if wrapped in other text
-            json_match = re.search(r'\{.*\}', quiz_text, re.DOTALL)
+        except json.JSONDecodeError as e:
+            print(f"JSON Parse Error: {e}")
+            print(f"Response text: {quiz_text[:500]}...")
+            # Try to extract JSON array from response
+            json_match = re.search(r'\[.*\]', quiz_text, re.DOTALL)
             if json_match:
-                quiz_data = json.loads(json_match.group())
+                try:
+                    quiz_data = json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    raise ValueError(f"Could not parse JSON from response. Raw response: {quiz_text[:200]}...")
             else:
-                raise ValueError("Could not parse JSON from response")
+                raise ValueError(f"No JSON array found in response. Raw response: {quiz_text[:200]}...")
         
         # Validate the structure
-        if not isinstance(quiz_data, dict) or 'questions' not in quiz_data:
-            raise ValueError("Invalid quiz format")
+        if not isinstance(quiz_data, list):
+            raise ValueError("Response is not a JSON array")
         
-        if len(quiz_data['questions']) != num_questions:
-            raise ValueError(f"Expected {num_questions} questions, got {len(quiz_data['questions'])}")
+        if len(quiz_data) != num_questions:
+            print(f"Warning: Expected {num_questions} questions, got {len(quiz_data)}")
+            # Don't fail, just use what we got if it's reasonable
+            if len(quiz_data) == 0:
+                raise ValueError(f"No questions generated")
         
-        # Validate each question
-        for i, q in enumerate(quiz_data['questions']):
-            required_fields = ['question_text', 'option_a', 'option_b', 'option_c', 'option_d', 'correct_option', 'explanation']
-            for field in required_fields:
-                if field not in q:
-                    raise ValueError(f"Question {i+1} missing field: {field}")
+        # Validate and fix each question
+        validated_questions = []
+        for i, q in enumerate(quiz_data):
+            if not isinstance(q, dict):
+                raise ValueError(f"Question {i+1} is not an object")
             
-            if q['correct_option'] not in ['A', 'B', 'C', 'D']:
+            # Check required fields
+            required_fields = ['question_text', 'option_a', 'option_b', 'option_c', 'option_d', 'correct_option']
+            missing_fields = [field for field in required_fields if field not in q or not q[field]]
+            
+            if missing_fields:
+                print(f"Question {i+1} missing/empty fields: {missing_fields}")
+                raise ValueError(f"Question {i+1} missing field: {missing_fields[0]}")
+            
+            # Validate correct_option
+            if q['correct_option'].upper() not in ['A', 'B', 'C', 'D']:
+                print(f"Question {i+1} has invalid correct_option: {q['correct_option']}")
                 raise ValueError(f"Question {i+1} has invalid correct_option: {q['correct_option']}")
+            
+            # Normalize correct_option to uppercase
+            q['correct_option'] = q['correct_option'].upper()
+            
+            # Ensure all fields are strings and non-empty
+            for field in required_fields:
+                if not isinstance(q[field], str) or not q[field].strip():
+                    raise ValueError(f"Question {i+1} field '{field}' is empty or not a string")
+                q[field] = q[field].strip()
+            
+            validated_questions.append(q)
         
         return {
             "success": True,
-            "topic": quiz_data.get('topic', topic or 'Generated Quiz'),
-            "questions": quiz_data['questions'],
-            "total_questions": len(quiz_data['questions'])
+            "topic": topic or "Generated Quiz",
+            "questions": validated_questions,
+            "total_questions": len(validated_questions)
         }
         
     except Exception as e:
+        error_msg = str(e)
+        print(f"Quiz generation error: {error_msg}")
         return {
             "success": False,
-            "error": f"Failed to generate quiz: {str(e)}",
+            "error": f"Failed to generate quiz: {error_msg}",
             "questions": [],
             "total_questions": 0
         }

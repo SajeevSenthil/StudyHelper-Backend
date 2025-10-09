@@ -58,7 +58,8 @@ venv.bak/
 *.swp
 *.swo
 *~
-
+__pycache__/
+*.pyc   
 # OS
 .DS_Store
 .DS_Store?
@@ -67,3 +68,6 @@ venv.bak/
 .Trashes
 ehthumbs.db
 Thumbs.db
+__pycache__/resources.cpython-311.pyc
+requirements.txt
+__pycache__/quiz_database.cpython-311.pyc
