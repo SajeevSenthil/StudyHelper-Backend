@@ -41,7 +41,7 @@ Generates a multiple-choice quiz with specified number of questions either from 
 
 ### 1. Topic-Based Quiz Generation
 ```bash
-curl -X POST "http://localhost:8000/api/generate-quiz" \
+curl -X POST "/api/generate-quiz" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-jwt-token" \
   -d '{
@@ -52,7 +52,7 @@ curl -X POST "http://localhost:8000/api/generate-quiz" \
 
 ### 2. Document-Based Quiz Generation
 ```bash
-curl -X POST "http://localhost:8000/api/generate-quiz" \
+curl -X POST "/api/generate-quiz" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-jwt-token" \
   -d '{

@@ -1580,10 +1580,10 @@ async def get_quiz_attempt_detail(user_quiz_id: int):
             "user_quiz_id": user_quiz_id,
             "quiz_id": quiz_id,
             "topic": quiz_info["topic"],
-            "taken_date": user_quiz["taken_date"],
+            "taken_date": user_quiz.get("created_at", user_quiz.get("taken_date")),  # Use created_at if taken_date doesn't exist
             "total_marks": user_quiz["total_marks"],
             "score": user_quiz["score"],
-            "percentage": user_quiz["percentage"],
+            "percentage": (user_quiz["score"] / user_quiz["total_marks"]) * 100 if user_quiz["total_marks"] > 0 else 0,
             "detailed_results": detailed_results
         }
         
@@ -1600,4 +1600,4 @@ def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8002)
+    uvicorn.run(app, host="127.0.0.1", port=8080)

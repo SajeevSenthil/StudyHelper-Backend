@@ -8,7 +8,7 @@ import requests
 import json
 import sys
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = ""
 
 def test_quiz_submission_report():
     """Test the enhanced quiz submission report format"""

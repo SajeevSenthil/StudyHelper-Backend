@@ -73,7 +73,7 @@ def test_api_endpoint():
     print("\n3. Testing NEW API Endpoint...")
     
     # Base URL for the API
-    BASE_URL = "http://localhost:8000"
+    BASE_URL = ""
     
     # Test topic-based quiz generation
     print("\n   3a. Testing topic-based API call...")
@@ -128,7 +128,7 @@ def test_api_with_document():
     """Test API with document ID"""
     print("\n   3b. Testing document-based API call...")
     
-    BASE_URL = "http://localhost:8000"
+    BASE_URL = ""
     url = f"{BASE_URL}/api/generate-quiz"
     headers = {"Content-Type": "application/json"}
     

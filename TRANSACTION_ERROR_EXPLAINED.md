@@ -132,7 +132,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 ### Step 2: Test Quiz Generation
 ```bash
-curl -X POST http://localhost:8000/quiz/generate \
+curl -X POST /quiz/generate \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -d '{

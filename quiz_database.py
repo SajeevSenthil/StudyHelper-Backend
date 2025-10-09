@@ -651,6 +651,7 @@ def get_user_quiz_attempts(user_id: str, limit: int = 50) -> Dict[str, Any]:
                 uq.user_quiz_id,
                 uq.total_marks,
                 uq.score,
+                uq.created_at,
                 q.quiz_id,
                 q.topic
             FROM user_quizzes uq
@@ -671,7 +672,7 @@ def get_user_quiz_attempts(user_id: str, limit: int = 50) -> Dict[str, Any]:
                 "user_quiz_id": attempt['user_quiz_id'],
                 "quiz_id": attempt['quiz_id'],
                 "topic": attempt['topic'],
-                "completed_at": None,  # Not stored in current schema
+                "completed_at": attempt.get('created_at'),  # Use created_at as completion time
                 "total_marks": attempt['total_marks'],
                 "score": attempt['score'],
                 "percentage": round(percentage, 2),
@@ -705,7 +706,8 @@ def get_user_quiz_attempts_supabase(user_id: str, limit: int = 50) -> Dict[str, 
             user_quiz_id,
             total_marks,
             score,
-            quiz_id
+            quiz_id,
+            created_at
         """).eq("user_id", user_id).order("user_quiz_id", desc=True).limit(limit).execute()
         
         if not attempts_result.data:
@@ -731,7 +733,7 @@ def get_user_quiz_attempts_supabase(user_id: str, limit: int = 50) -> Dict[str, 
                     "user_quiz_id": attempt['user_quiz_id'],
                     "quiz_id": attempt['quiz_id'],
                     "topic": quiz_info['topic'],
-                    "completed_at": None,  # Not stored in current schema
+                    "completed_at": attempt.get('created_at'),  # Use created_at as completion time
                     "total_marks": attempt['total_marks'],
                     "score": attempt['score'],
                     "percentage": round(percentage, 2),
