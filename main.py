@@ -116,7 +116,12 @@ def get_optional_user(credentials: Optional[HTTPAuthorizationCredentials] = Depe
 # Add CORS middleware for frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],  # Next.js default ports
+    allow_origins=[
+        "http://localhost:3000", 
+        "http://localhost:3001",  # Next.js default ports
+        "https://study-helper-frontend-s3ts-pmj5b0aec.vercel.app",  # Production frontend
+        "https://*.vercel.app"  # All Vercel preview deployments
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
