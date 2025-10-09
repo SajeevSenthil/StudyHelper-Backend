@@ -646,20 +646,46 @@ def get_user_quiz_attempts(user_id: str, limit: int = 50) -> Dict[str, Any]:
     try:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        attempts_select_sql = """
-            SELECT 
-                uq.user_quiz_id,
-                uq.total_marks,
-                uq.score,
-                uq.created_at,
-                q.quiz_id,
-                q.topic
-            FROM user_quizzes uq
-            JOIN quizzes q ON uq.quiz_id = q.quiz_id
-            WHERE uq.user_id = %s
-            ORDER BY uq.user_quiz_id DESC
-            LIMIT %s;
+        # First check if created_at column exists in user_quizzes table
+        column_check_sql = """
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'user_quizzes' AND column_name = 'created_at';
         """
+        cursor.execute(column_check_sql)
+        has_created_at = cursor.fetchone() is not None
+        
+        # Build query based on available columns
+        if has_created_at:
+            attempts_select_sql = """
+                SELECT 
+                    uq.user_quiz_id,
+                    uq.total_marks,
+                    uq.score,
+                    uq.created_at,
+                    q.quiz_id,
+                    q.topic
+                FROM user_quizzes uq
+                JOIN quizzes q ON uq.quiz_id = q.quiz_id
+                WHERE uq.user_id = %s
+                ORDER BY uq.user_quiz_id DESC
+                LIMIT %s;
+            """
+        else:
+            attempts_select_sql = """
+                SELECT 
+                    uq.user_quiz_id,
+                    uq.total_marks,
+                    uq.score,
+                    q.quiz_id,
+                    q.topic
+                FROM user_quizzes uq
+                JOIN quizzes q ON uq.quiz_id = q.quiz_id
+                WHERE uq.user_id = %s
+                ORDER BY uq.user_quiz_id DESC
+                LIMIT %s;
+            """
+        
         cursor.execute(attempts_select_sql, (user_id, limit))
         attempts_data = cursor.fetchall()
         
@@ -672,7 +698,7 @@ def get_user_quiz_attempts(user_id: str, limit: int = 50) -> Dict[str, Any]:
                 "user_quiz_id": attempt['user_quiz_id'],
                 "quiz_id": attempt['quiz_id'],
                 "topic": attempt['topic'],
-                "completed_at": attempt.get('created_at'),  # Use created_at as completion time
+                "completed_at": attempt.get('created_at') if has_created_at else None,
                 "total_marks": attempt['total_marks'],
                 "score": attempt['score'],
                 "percentage": round(percentage, 2),
